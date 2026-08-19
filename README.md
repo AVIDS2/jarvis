@@ -23,7 +23,7 @@
 .\run.ps1 -Ui web
 ```
 
-桌面快捷方式 `Jarvis 实时语音助手` 和 `Jarvis 原生语音 UI` 均启动原生界面。`Jarvis Web UI（实验）` 才启动 pi-web。两种界面复用同一套 Whispera 后端、Pi AgentSession 和持久上下文，不要同时启动两个麦克风客户端。
+桌面默认只保留一个 `Jarvis 实时语音助手` 快捷方式，启动原生低延迟界面。`launch-legacy-hidden.vbs` 和 `launch-web-hidden.vbs` 仍可手动用于回归/实验；Web UI 不是生产语音入口。两种界面复用同一套 Whispera 后端、Pi AgentSession 和持久上下文，不要同时启动两个麦克风客户端。
 
 Electron 使用单实例锁；重复点击快捷方式只会唤起现有窗口，不会再启动第二个麦克风客户端。
 
