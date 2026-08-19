@@ -1,0 +1,15 @@
+{
+  "name": "jarvis-voice-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension for cloud TTS voice and assistant standby control",
+  "keywords": ["pi-package", "tts", "voice", "standby"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/tts-voice.ts"]
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "jarvis-agent-bridge",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.19.0" },
+  "scripts": {
+    "start": "node bridge.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "file:../../pi/packages/ai",
+    "@earendil-works/pi-coding-agent": "file:../../pi/packages/coding-agent",
+    "mem0ai": "^3.0.7"
+  }
+}
+

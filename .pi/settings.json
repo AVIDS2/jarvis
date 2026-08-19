@@ -1,0 +1,11 @@
+{
+  "packages": [
+    "..\\packages\\netease-music",
+    "..\\packages\\jarvis-subagents",
+    "..\\packages\\jarvis-voice-control",
+    "..\\packages\\jarvis-character-control"
+  ],
+  "compaction": {
+    "enabled": true
+  }
+}

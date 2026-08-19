@@ -1,0 +1,13 @@
+{
+  "name": "jarvis-netease-music",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Jarvis Pi extension for the official NetEase Cloud Music CLI",
+  "keywords": ["pi-package", "netease", "music"],
+  "dependencies": {
+    "@music163/ncm-cli": "0.1.6"
+  },
+  "pi": {
+    "extensions": ["./extensions/netease-music.ts"]
+  }
+}

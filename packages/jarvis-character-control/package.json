@@ -1,0 +1,15 @@
+{
+  "name": "jarvis-character-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi extension for explicit realtime assistant expressions",
+  "keywords": ["pi-package", "character", "expression"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/character-expression.ts"]
+  }
+}
