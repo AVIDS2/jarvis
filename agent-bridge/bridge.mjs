@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { complete, getModel } from "@earendil-works/pi-ai/compat";
+import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
 import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
 import { authorizeStandbyChange } from "./standby-authorization.mjs";
 import {
@@ -211,14 +211,21 @@ async function createSessionEntry(sessionManager) {
               }
             }
             const live = entry.live;
-            if (!live || live.assistantTextStarted || live.acknowledgementSent || !live.sendProgress) return;
+            if (!live || live.assistantTextStarted || live.acknowledgementSent || !live.sendProgress) {
+              live?.flushVisualQueue?.();
+              return;
+            }
             const acknowledgement = await generateToolAcknowledgement(ctx.model || model, live.userText);
-            if (!acknowledgement || entry.live !== live || !live.sendProgress) return;
+            if (!acknowledgement || entry.live !== live || !live.sendProgress) {
+              live.flushVisualQueue?.();
+              return;
+            }
             live.acknowledgementSent = true;
             live.sendProgress(acknowledgement, "tool_acknowledgement");
             // Let the streamed acknowledgement reach the TTS worker before the
             // real tool starts. It is short enough not to make work feel gated.
             await new Promise((resolve) => setTimeout(resolve, TOOL_ACK_AUDIO_LEAD_MS));
+            live.flushVisualQueue?.();
           });
         },
       },
@@ -282,7 +289,7 @@ function textFromMessage(message) {
   return message.content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("").trim();
 }
 
-const TOOL_ACK_TIMEOUT_MS = 2_500;
+const TOOL_ACK_TIMEOUT_MS = 4_000;
 const TOOL_ACK_AUDIO_LEAD_MS = 900;
 const TOOL_ACK_SYSTEM_PROMPT = [
   `你是${ASSISTANT_NAME}的实时语音对话层。用户刚提出一个需要执行的请求。`,
@@ -295,7 +302,7 @@ async function generateToolAcknowledgement(currentModel, userText) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TOOL_ACK_TIMEOUT_MS);
   try {
-    const response = await complete(
+    const stream = streamSimple(
       currentModel,
       {
         systemPrompt: TOOL_ACK_SYSTEM_PROMPT,
@@ -309,12 +316,27 @@ async function generateToolAcknowledgement(currentModel, userText) {
       },
       { signal: controller.signal, reasoning: "off", maxTokens: 48 },
     );
-    if (response.stopReason === "aborted" || response.stopReason === "error") {
-      console.warn(`Tool acknowledgement was not generated: ${response.errorMessage || response.stopReason}`);
-      return "";
+    let text = "";
+    for await (const event of stream) {
+      if (event.type === "text_delta") {
+        text += event.delta;
+        const normalized = text.replace(/\s+/g, " ").trim();
+        if (normalized.length > 96) {
+          controller.abort();
+          return "";
+        }
+        if (/[。！？!?]$/.test(normalized)) {
+          controller.abort();
+          return normalized;
+        }
+      }
+      if (event.type === "error") {
+        console.warn(`Tool acknowledgement was not generated: ${event.error.errorMessage || event.reason}`);
+        return "";
+      }
     }
-    const text = textFromMessage(response).replace(/\s+/g, " ").trim();
-    return text.length > 0 && text.length <= 96 ? text : "";
+    const normalized = text.replace(/\s+/g, " ").trim();
+    return normalized.length > 0 && normalized.length <= 96 ? normalized : "";
   } catch (error) {
     console.warn(`Tool acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
     return "";
@@ -570,6 +592,8 @@ async function handleCompletion(req, res, payload) {
     assistantTextStarted: false,
     sendProgress: null,
     sendVisualState: null,
+    visualQueue: [],
+    flushVisualQueue: null,
     spokenProgress: new Set(),
   };
   entry.live = live;
@@ -587,6 +611,26 @@ async function handleCompletion(req, res, payload) {
     if (!visualEvent || disconnected || res.writableEnded) return;
     sse(res, visualEvent);
   };
+  live.flushVisualQueue = () => {
+    if (!live.visualQueue.length) return;
+    const queued = live.visualQueue.splice(0);
+    for (const visualEvent of queued) live.sendVisualState(visualEvent);
+  };
+  const queueOrSendVisualState = (visualEvent, toolName) => {
+    if (!visualEvent) return;
+    // A visual work indicator must not get ahead of the model-generated spoken
+    // acknowledgement. This is an SSE-only ordering buffer; the Pi tool hook
+    // still owns execution and remains independent of the browser.
+    if (
+      toolName !== "show_assistant_expression"
+      && !live.assistantTextStarted
+      && !live.acknowledgementSent
+    ) {
+      live.visualQueue.push(visualEvent);
+      return;
+    }
+    live.sendVisualState(visualEvent);
+  };
   const onResponseClose = () => {
     if (res.writableEnded) return;
     disconnected = true;
@@ -597,18 +641,18 @@ async function handleCompletion(req, res, payload) {
   const unsubscribe = entry.session.subscribe((event) => {
     if (disconnected) return;
     if (event.type === "tool_execution_start") {
-      live.sendVisualState?.(visualStateFromToolStart(event));
+      queueOrSendVisualState(visualStateFromToolStart(event), event.toolName);
       return;
     }
     if (event.type === "tool_execution_update") {
-      live.sendVisualState?.(visualStateFromToolUpdate(event));
+      queueOrSendVisualState(visualStateFromToolUpdate(event), event.toolName);
       const progress = spokenToolUpdate(event.partialResult);
       if (!progress) return;
       sendProgress(progress, "tool_progress");
       return;
     }
     if (event.type === "tool_execution_end") {
-      live.sendVisualState?.(visualStateFromToolEnd(event));
+      queueOrSendVisualState(visualStateFromToolEnd(event), event.toolName);
       return;
     }
     if (event.type === "message_update") {
