@@ -293,13 +293,26 @@ async function extensionCatalog() {
   };
 }
 
-async function controlNeteaseMusic(action) {
-  const args = NETEASE_ACTION_ARGS[action];
+async function controlNeteaseMusic(action, payload = {}) {
+  const args = action === "volume"
+    ? ["volume", String(Math.max(0, Math.min(100, Number(payload.level))))]
+    : NETEASE_ACTION_ARGS[action];
+  if (action === "volume" && !Number.isFinite(Number(payload.level))) {
+    throw new Error("volume must be a number between 0 and 100");
+  }
   if (!args) throw new Error("unsupported music control action");
   const result = await runNeteaseCli(args);
   const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
-  const payload = parseCliJson(result.stdout);
-  const state = payload?.state || (action === "state" ? payload?.state : null);
+  const resultPayload = parseCliJson(result.stdout);
+  let state = resultPayload?.state || null;
+  if (!state && action !== "state") {
+    try {
+      const stateResult = await runNeteaseCli(["state", "--output", "json"]);
+      state = parseCliJson(stateResult.stdout)?.state || null;
+    } catch {
+      // The command already succeeded; the panel can still show its result.
+    }
+  }
   return {
     action,
     state: state || null,
@@ -876,11 +889,11 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && req.url === "/v1/extensions/netease-music/control") {
       const payload = await body(req);
       const action = String(payload.action || "").trim();
-      if (!NETEASE_ACTION_ARGS[action]) {
+      if (!NETEASE_ACTION_ARGS[action] && action !== "volume") {
         return json(res, 400, { error: { message: "unsupported music control action" } });
       }
       try {
-        return json(res, 200, await controlNeteaseMusic(action));
+        return json(res, 200, await controlNeteaseMusic(action, payload));
       } catch (error) {
         return json(res, 502, { error: { message: "网易云播放器命令执行失败，请检查 ncm-cli 和本机播放器。" } });
       }
