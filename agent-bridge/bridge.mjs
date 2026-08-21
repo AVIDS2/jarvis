@@ -1,5 +1,5 @@
 import { createServer } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -191,6 +191,29 @@ async function runNeteaseCli(args, timeout = 5000) {
   });
 }
 
+function powershellLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function launchNeteaseLogin() {
+  if (!existsSync(NETEASE_CLI)) throw new Error("ncm-cli 未安装");
+  if (process.platform !== "win32") throw new Error("当前仅实现 Windows 终端登录启动");
+
+  const command = [
+    `$Host.UI.RawUI.WindowTitle = ${powershellLiteral("Jarvis · 网易云官方登录")}`,
+    `Set-Location -LiteralPath ${powershellLiteral(NETEASE_ROOT)}`,
+    `& ${powershellLiteral(process.execPath)} ${powershellLiteral(NETEASE_CLI)} login`,
+  ].join("; ");
+  const child = spawn("powershell.exe", ["-NoExit", "-NoLogo", "-Command", command], {
+    cwd: NETEASE_ROOT,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: false,
+  });
+  child.unref();
+  return { started: true };
+}
+
 function parseCliJson(stdout) {
   try {
     return JSON.parse(String(stdout || "").trim());
@@ -275,17 +298,17 @@ async function neteaseExtensionStatus() {
 
 async function extensionCatalog() {
   const definitions = [
-    ["jarvis_voice_control", "语音与待机", "云端 TTS、音色配置和小爱小爱唤醒/睡眠。", ["set_tts_voice", "set_assistant_standby"]],
-    ["jarvis_character_control", "角色状态", "把 Agent 的表达状态同步给原生交互形象。", ["show_assistant_expression"]],
-    ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task"]],
-    ["jarvis_long_memory", "长期记忆", "在 Pi 会话外接入长期记忆召回，不改变短期上下文。", []],
-  ].map(([id, label, description, tools]) => ({
+    ["jarvis_voice_control", "语音与待机", "云端 TTS、音色配置和唤醒词待机控制。", ["set_tts_voice", "set_assistant_standby"], true],
+    ["jarvis_character_control", "角色状态", "把 Agent 的表达状态同步给原生交互形象。", ["show_assistant_expression"], true],
+    ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task"], true],
+    ["jarvis_long_memory", "长期记忆", "在 Pi 会话外接入长期记忆召回，不改变短期上下文。", [], Boolean(MEM0_API_KEY)],
+  ].map(([id, label, description, tools, enabled]) => ({
     id,
     label,
     package: id,
     tools,
-    status: "已配置",
-    description: `${description} 当前状态为项目配置状态，不提前创建 Pi 会话。`,
+    status: enabled ? "已加载" : "未配置",
+    description: enabled ? description : `${description} 当前未配置 Mem0 API Key，不会伪装成已启用。`,
   }));
   return {
     generatedAt: new Date().toISOString(),
@@ -885,6 +908,13 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && req.url === "/v1/extensions") {
       return json(res, 200, await extensionCatalog());
+    }
+    if (req.method === "POST" && req.url === "/v1/extensions/netease-music/login") {
+      try {
+        return json(res, 200, launchNeteaseLogin());
+      } catch (error) {
+        return json(res, 409, { error: { message: error.message || "无法启动网易云官方登录" } });
+      }
     }
     if (req.method === "POST" && req.url === "/v1/extensions/netease-music/control") {
       const payload = await body(req);
