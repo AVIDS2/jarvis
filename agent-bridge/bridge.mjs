@@ -376,7 +376,6 @@ async function createSessionEntry(sessionManager) {
               systemPrompt: [
                 event.systemPrompt,
                 `Runtime identity: your configured display name is ${ASSISTANT_NAME}. When asked who you are, introduce yourself using that exact name.`,
-                "Realtime work rule: when the current request requires a tool or other external work, emit one short natural spoken acknowledgement as your first assistant text before issuing the tool call. Let the wording follow the conversation; do not repeat the user's request, use a fixed template, or mention internal tools. Then continue with tool execution and useful progress updates.",
                 entry.memoryContext,
               ].filter(Boolean).join("\n\n"),
             };
