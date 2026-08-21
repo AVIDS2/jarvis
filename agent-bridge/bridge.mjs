@@ -1,7 +1,10 @@
 import { createServer } from "node:http";
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
@@ -14,6 +17,7 @@ import {
 } from "./visual-state.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const execFileAsync = promisify(execFile);
 const envFile = resolve(ROOT, ".env");
 
 function loadEnvFile(path) {
@@ -54,6 +58,14 @@ const SESSION_ROOT = resolve(DATA_ROOT, "pi-sessions");
 const SESSION_INDEX_PATH = resolve(DATA_ROOT, "pi-session-index.json");
 const USER_SESSIONS_PATH = resolve(DATA_ROOT, "user-sessions.json");
 const PI_CLI_PATH = resolve(ROOT, "..", "pi", "packages", "coding-agent", "dist", "cli.js");
+const NETEASE_ROOT = resolve(ROOT, "packages", "netease-music");
+const NETEASE_CLI = resolve(NETEASE_ROOT, "node_modules", "@music163", "ncm-cli", "dist", "index.js");
+const NETEASE_CONFIG_ROOT = resolve(
+  process.env.XDG_CONFIG_HOME || resolve(homedir(), ".config"),
+  "ncm-cli",
+);
+const NETEASE_CREDENTIALS = resolve(NETEASE_CONFIG_ROOT, "credentials.enc.json");
+const NETEASE_CONFIG = resolve(NETEASE_CONFIG_ROOT, "config.json");
 mkdirSync(SESSION_ROOT, { recursive: true });
 if (existsSync(PI_CLI_PATH) && !process.env.JARVIS_PI_CLI_PATH) process.env.JARVIS_PI_CLI_PATH = PI_CLI_PATH;
 
@@ -158,6 +170,142 @@ function sessionId(value) {
     throw new Error("invalid session_id");
   }
   return id;
+}
+
+const NETEASE_ACTION_ARGS = Object.freeze({
+  pause: ["pause"],
+  resume: ["resume"],
+  next: ["next"],
+  previous: ["prev"],
+  stop: ["stop"],
+  state: ["state"],
+});
+
+async function runNeteaseCli(args, timeout = 5000) {
+  return execFileAsync(process.execPath, [NETEASE_CLI, ...args], {
+    cwd: NETEASE_ROOT,
+    env: process.env,
+    windowsHide: true,
+    timeout,
+    maxBuffer: 256 * 1024,
+  });
+}
+
+function parseCliJson(stdout) {
+  try {
+    return JSON.parse(String(stdout || "").trim());
+  } catch {
+    return null;
+  }
+}
+
+function musicStateSummary(state) {
+  const status = String(state?.status || "").toLowerCase();
+  const labels = { playing: "播放中", paused: "已暂停", stopped: "已停止" };
+  const label = labels[status] || (status ? status : "状态未知");
+  const queueLength = Number.isFinite(Number(state?.queueLength)) ? `，队列 ${state.queueLength} 首` : "";
+  return `网易云：${label}${queueLength}`;
+}
+
+function commandNames(stdout) {
+  return String(stdout || "")
+    .split(/\r?\n/)
+    .map((line) => /^([a-z][a-z0-9-]*)\s/.exec(line)?.[1])
+    .filter(Boolean);
+}
+
+async function neteaseExtensionStatus() {
+  const configured = existsSync(NETEASE_CONFIG) && existsSync(NETEASE_CREDENTIALS);
+  if (!existsSync(NETEASE_CLI)) {
+    return {
+      id: "netease_music",
+      label: "网易云音乐",
+      package: "@music163/ncm-cli",
+      status: "unavailable",
+      description: "未找到本地 ncm-cli，播放控制不会伪装成可用。",
+      auth: { configured, authenticated: false, message: "ncm-cli 未安装" },
+      player: { summary: "播放器不可用" },
+      availableActions: [],
+    };
+  }
+
+  let authenticated = false;
+  let authMessage = configured ? "登录态未验证" : "尚未完成一次 CLI 配置和登录";
+  try {
+    const result = await runNeteaseCli(["login", "--check", "--output", "json"]);
+    const payload = parseCliJson(result.stdout);
+    authenticated = payload?.success === true;
+    authMessage = String(payload?.message || (authenticated ? "登录态有效" : authMessage));
+  } catch {
+    authMessage = "登录检查失败，未自动发起登录";
+  }
+
+  let player = { summary: "播放器状态未读取" };
+  try {
+    const result = await runNeteaseCli(["state", "--output", "json"]);
+    const payload = parseCliJson(result.stdout);
+    if (payload?.state) player = { ...payload.state, summary: musicStateSummary(payload.state) };
+  } catch {
+    player = { summary: "播放器状态不可用" };
+  }
+
+  let availableActions = [];
+  try {
+    const result = await runNeteaseCli(["commands"]);
+    const names = new Set(commandNames(result.stdout));
+    availableActions = ["search", "recommend", "pause", "resume", "next", "prev", "stop", "state", "volume", "play"]
+      .filter((name) => names.has(name));
+  } catch {
+    // The capability panel remains useful with auth/player state alone.
+  }
+
+  return {
+    id: "netease_music",
+    label: "网易云音乐",
+    package: "@music163/ncm-cli",
+    status: authenticated ? "ready" : configured ? "auth_required" : "needs_setup",
+    description: availableActions.includes("search")
+      ? "Pi 外部扩展，通过 ncm-cli 控制本机播放器和搜索。"
+      : "Pi 外部扩展，可控制本机播放器；当前安装的 ncm-cli 未暴露 search 命令，点歌能力暂不可用。",
+    auth: { configured, authenticated, message: authMessage },
+    player,
+    availableActions,
+  };
+}
+
+async function extensionCatalog() {
+  const definitions = [
+    ["jarvis_voice_control", "语音与待机", "云端 TTS、音色配置和小爱小爱唤醒/睡眠。", ["set_tts_voice", "set_assistant_standby"]],
+    ["jarvis_character_control", "角色状态", "把 Agent 的表达状态同步给原生交互形象。", ["show_assistant_expression"]],
+    ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task"]],
+    ["jarvis_long_memory", "长期记忆", "在 Pi 会话外接入长期记忆召回，不改变短期上下文。", []],
+  ].map(([id, label, description, tools]) => ({
+    id,
+    label,
+    package: id,
+    tools,
+    status: "已配置",
+    description: `${description} 当前状态为项目配置状态，不提前创建 Pi 会话。`,
+  }));
+  return {
+    generatedAt: new Date().toISOString(),
+    extensions: [...definitions, await neteaseExtensionStatus()],
+  };
+}
+
+async function controlNeteaseMusic(action) {
+  const args = NETEASE_ACTION_ARGS[action];
+  if (!args) throw new Error("unsupported music control action");
+  const result = await runNeteaseCli(args);
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+  const payload = parseCliJson(result.stdout);
+  const state = payload?.state || (action === "state" ? payload?.state : null);
+  return {
+    action,
+    state: state || null,
+    summary: state ? musicStateSummary(state) : `网易云命令已执行：${action}`,
+    output: output.slice(0, 2000),
+  };
 }
 
 async function getSession(id) {
@@ -721,6 +869,21 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && req.url === "/v1/models") {
       return json(res, 200, { object: "list", data: [{ id: MODEL_ID, object: "model", owned_by: "xiaomi" }] });
+    }
+    if (req.method === "GET" && req.url === "/v1/extensions") {
+      return json(res, 200, await extensionCatalog());
+    }
+    if (req.method === "POST" && req.url === "/v1/extensions/netease-music/control") {
+      const payload = await body(req);
+      const action = String(payload.action || "").trim();
+      if (!NETEASE_ACTION_ARGS[action]) {
+        return json(res, 400, { error: { message: "unsupported music control action" } });
+      }
+      try {
+        return json(res, 200, await controlNeteaseMusic(action));
+      } catch (error) {
+        return json(res, 502, { error: { message: "网易云播放器命令执行失败，请检查 ncm-cli 和本机播放器。" } });
+      }
     }
     if (req.method === "GET" && req.url === "/v1/sessions") {
       return json(res, 200, { sessions: await listUserSessions() });

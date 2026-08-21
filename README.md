@@ -29,6 +29,8 @@ Electron 使用单实例锁；重复点击快捷方式只会唤起现有窗口�
 
 当前本地唤醒使用 sherpa-onnx 的中文流式 KWS 模型，声学唤醒词为 `小爱同学`。它直接处理 16kHz PCM，不依赖云 ASR，也不匹配转录文本。
 
+网易云音乐通过独立的 `jarvis-netease-music` Pi 扩展调用 `@music163/ncm-cli`。CLI 的 App ID / 私钥配置和账号登录只在本机配置目录保存；扩展只检查现有登录态，不会在每次请求失败时自动再次拉起二维码登录。原生 UI 的“扩展”面板只展示 CLI 实际返回的命令和播放器状态，不会把尚未安装或当前 CLI 不支持的搜索命令伪装成可用能力。当前 ncm-cli 文档入口见 [网易云音乐 CLI 文档](https://developer.music.163.com/st/developer/document?docId=2327e302009c437eb02af48f63d6e514)。
+
 ### 实时链路验收
 
 ```powershell
