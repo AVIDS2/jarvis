@@ -22,6 +22,8 @@ test("tool identities map to deterministic visual states", () => {
   assert.equal(visualStateFromToolStart({ toolName: "grep", args: {} }).state, "radar");
   assert.equal(visualStateFromToolStart({ toolName: "edit", args: {} }).state, "writing");
   assert.equal(visualStateFromToolStart({ toolName: "netease_music", args: { action: "play_request" } }).state, "searching");
+  assert.equal(visualStateFromToolStart({ toolName: "youtube_media", args: { action: "search" } }).state, "searching");
+  assert.equal(visualStateFromToolStart({ toolName: "youtube_media", args: { action: "play" } }).state, "loading");
 });
 
 test("structured updates override generic tool states", () => {

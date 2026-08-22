@@ -3,7 +3,8 @@
     "..\\packages\\netease-music",
     "..\\packages\\jarvis-subagents",
     "..\\packages\\jarvis-voice-control",
-    "..\\packages\\jarvis-character-control"
+    "..\\packages\\jarvis-character-control",
+    "..\\packages\\youtube-media"
   ],
   "compaction": {
     "enabled": true

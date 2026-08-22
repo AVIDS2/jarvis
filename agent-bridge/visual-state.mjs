@@ -9,6 +9,7 @@ export const VISUAL_STATES = Object.freeze([
 
 const VISUAL_STATE_SET = new Set(VISUAL_STATES);
 const SEARCH_ACTIONS = new Set(["search_song", "daily_recommendations", "play_request"]);
+const YOUTUBE_SEARCH_ACTIONS = new Set(["search", "metadata", "transcript"]);
 
 export function normalizeVisualState(value) {
   const state = String(value || "").trim().toLowerCase();
@@ -63,6 +64,14 @@ export function visualStateFromToolStart(event) {
     const action = String(input.action || "");
     return visualStateEvent(SEARCH_ACTIONS.has(action) ? "searching" : "loading", {
       source: toolName,
+      priority: 60,
+    });
+  }
+  if (toolName === "youtube_media") {
+    const action = String(input.action || "");
+    return visualStateEvent(YOUTUBE_SEARCH_ACTIONS.has(action) ? "searching" : "loading", {
+      source: toolName,
+      phase: "tool_start",
       priority: 60,
     });
   }
