@@ -10,7 +10,10 @@ const [agents, persona] = await Promise.all([
 ]);
 
 assert.match(persona, /只追加到 Pi 的默认系统提示词之后/);
-assert.match(persona, /运行时提供名称/);
+assert.match(persona, /运行时显示名|运行时名称/);
+assert.match(persona, /语音只是你与用户相遇的媒介/);
+assert.match(persona, /不要把自己降格成/);
+assert.match(persona, /从当前角色设定、世界观和关系出发回答/);
 assert.match(persona, /白月光/);
 assert.match(persona, /角色感不能授予不存在的能力/);
 assert.match(persona, /第一次工具调用前/);

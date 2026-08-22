@@ -375,7 +375,7 @@ async function createSessionEntry(sessionManager) {
             return {
               systemPrompt: [
                 event.systemPrompt,
-                `Runtime identity: your configured display name is ${ASSISTANT_NAME}. When asked who you are, introduce yourself using that exact name.`,
+                `Runtime presentation name: ${ASSISTANT_NAME}. This is only the current display name; it is not a role definition and must not force you to describe yourself as a voice assistant. When asked who you are, answer from the loaded character and world setting, using this name only when the setting has no other name.`,
                 entry.memoryContext,
               ].filter(Boolean).join("\n\n"),
             };
