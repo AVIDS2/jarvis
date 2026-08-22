@@ -1,0 +1,16 @@
+{
+  "name": "jarvis-screen-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "External Pi screen observation and Windows computer-use tools backed by Windows-MCP",
+  "keywords": ["pi-package", "jarvis", "screen", "computer-use", "windows-mcp", "multimodal"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/screen-control.ts"]
+  }
+}

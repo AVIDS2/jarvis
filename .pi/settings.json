@@ -4,7 +4,8 @@
     "..\\packages\\jarvis-subagents",
     "..\\packages\\jarvis-voice-control",
     "..\\packages\\jarvis-character-control",
-    "..\\packages\\youtube-media"
+    "..\\packages\\youtube-media",
+    "..\\packages\\jarvis-screen-control"
   ],
   "compaction": {
     "enabled": true

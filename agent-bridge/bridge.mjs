@@ -302,6 +302,7 @@ async function extensionCatalog() {
     ["jarvis_character_control", "角色状态", "把 Agent 的表达状态同步给原生交互形象。", ["show_assistant_expression"], true],
     ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task"], true],
     ["jarvis_youtube_media", "YouTube 视频", "搜索、播放、读取字幕和控制公开 YouTube 视频。", ["youtube_media"], true],
+    ["jarvis_screen_control", "屏幕协同", "通过 Windows-MCP 读取屏幕、识别 Windows UI 并执行明确的鼠标键盘操作。", ["screen_snapshot", "screen_state", "screen_action"], true],
     ["jarvis_long_memory", "长期记忆", "在 Pi 会话外接入长期记忆召回，不改变短期上下文。", [], Boolean(MEM0_API_KEY)],
   ].map(([id, label, description, tools, enabled]) => ({
     id,
