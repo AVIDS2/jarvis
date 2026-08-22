@@ -41,14 +41,14 @@ loadEnvFile(envFile);
 
 const PORT = Number(process.env.JARVIS_PORT || 3030);
 const MODEL_ID = process.env.JARVIS_MODEL || "mimo-v2.5";
-const ASSISTANT_NAME = (process.env.JARVIS_ASSISTANT_NAME || "实时语音助手").trim() || "实时语音助手";
+const ASSISTANT_NAME = (process.env.JARVIS_ASSISTANT_NAME || "未命名角色").trim() || "未命名角色";
 const MEMORY_RECALL_TIMEOUT_MS = Number(process.env.JARVIS_MEMORY_RECALL_TIMEOUT_MS || 120);
 const VOICE_TRANSCRIPT_CUSTOM_TYPE = "realtime-voice-transcript";
 const SESSION_REBASE_SUMMARY = [
   "This is a deliberate conversation handoff under the current workspace AGENTS.md rules.",
   "Discard all historical persona, user-name, and form-of-address assumptions.",
   "Address the user as 你 by default. Do not use any fixed name or pet name unless the user explicitly asks in the current conversation.",
-  `The assistant is ${ASSISTANT_NAME}, the user's private real-time computer voice assistant.`,
+  `The active character's presentation name is ${ASSISTANT_NAME}; this name is not a capability label. Answer future identity questions from the loaded character persona and world setting.`,
   "Keep future conversation continuity from this point forward; the prior session is retained only as an archive.",
 ].join(" ");
 const XIAOMI_API_KEY = (process.env.XIAOMI_API_KEY || "").trim();
@@ -375,7 +375,7 @@ async function createSessionEntry(sessionManager) {
             return {
               systemPrompt: [
                 event.systemPrompt,
-                `Runtime presentation name: ${ASSISTANT_NAME}. This is only the current display name; it is not a role definition and must not force you to describe yourself as a voice assistant. When asked who you are, answer from the loaded character and world setting, using this name only when the setting has no other name.`,
+                `Runtime presentation name: ${ASSISTANT_NAME}. This is only the current display name; it is not a role definition and must not force you to describe yourself as a voice assistant. When asked who you are, say this exact name first unless an explicitly loaded character profile provides another name, then answer from the loaded character and world setting.`,
                 entry.memoryContext,
               ].filter(Boolean).join("\n\n"),
             };
@@ -475,7 +475,7 @@ function textFromMessage(message) {
 const TOOL_ACK_TIMEOUT_MS = 4_000;
 const TOOL_ACK_AUDIO_LEAD_MS = 900;
 const TOOL_ACK_SYSTEM_PROMPT = [
-  `你是${ASSISTANT_NAME}的实时语音对话层。用户刚提出一个需要执行的请求。`,
+  `你是当前角色的实时语音回应层。用户刚提出一个需要执行的请求。`,
   "只输出一句自然、简短、适合立刻朗读的回应，表示你已接住这件事并马上开始。",
   "语气跟随上下文，避免套话，不要复述、引用或总结用户原话，不要提及工具、系统、模型、处理中。",
   "不要 Markdown、emoji、引号或解释。若无法自然回应，输出空文本。",
