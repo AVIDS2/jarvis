@@ -406,6 +406,7 @@ async function createSessionEntry(sessionManager) {
               systemPrompt: [
                 event.systemPrompt,
                 `Runtime presentation name: ${ASSISTANT_NAME}. This is only the current display name; it is not a role definition and must not force you to describe yourself as a voice assistant. When asked who you are, say this exact name first unless an explicitly loaded character profile provides another name, then answer from the loaded character and world setting.`,
+                activeCapabilityHint(entry),
                 entry.memoryContext,
               ].filter(Boolean).join("\n\n"),
             };
@@ -551,6 +552,14 @@ function textFromMessage(message) {
   if (typeof message.content === "string") return message.content.trim();
   if (!Array.isArray(message.content)) return "";
   return message.content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("").trim();
+}
+
+function activeCapabilityHint(entry) {
+  if (!entry.session) return "";
+  const names = entry.session.getActiveToolNames()
+    .filter((name) => !BUILTIN_TOOL_NAMES.has(name));
+  if (!names.length) return "当前没有额外外接工具。";
+  return `当前会话已加载并启用的外接工具：${names.join("、")}。这些工具描述是当前真实能力清单；不要因为角色是语音伙伴就否认它们。用户明确要求相关观察或操作时，调用最匹配的工具并以返回结果为准。`;
 }
 
 const TOOL_ACK_TIMEOUT_MS = 4_000;
