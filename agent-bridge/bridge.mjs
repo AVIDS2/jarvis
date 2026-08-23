@@ -8,13 +8,35 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
-import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  createEventBus,
+  DefaultResourceLoader,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { authorizeStandbyChange } from "./standby-authorization.mjs";
 import {
   visualStateFromToolEnd,
   visualStateFromToolStart,
   visualStateFromToolUpdate,
 } from "./visual-state.mjs";
+import {
+  isTerminalStatus,
+  latestTaskRecords,
+  TASK_ENTRY_TYPE,
+} from "../packages/jarvis-subagents/task-contract.mjs";
+
+const TASK_EVENT_CHANNEL = "jarvis:task-event";
+const TASK_CANCEL_CHANNEL = "jarvis:task-cancel";
+const TASK_LIFECYCLE_TYPES = new Set([
+  "task.queued",
+  "task.started",
+  "task.progress",
+  "task.completed",
+  "task.failed",
+  "task.cancelled",
+  "task.interrupted",
+]);
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const execFileAsync = promisify(execFile);
@@ -41,6 +63,7 @@ loadEnvFile(envFile);
 
 const PORT = Number(process.env.JARVIS_PORT || 3030);
 const MODEL_ID = process.env.JARVIS_MODEL || "mimo-v2.5";
+const VOICE_RUNTIME_HTTP_BASE = (process.env.MINIMIND_BACKEND_HTTP_BASE || "http://127.0.0.1:8111").replace(/\/$/, "");
 const ASSISTANT_NAME = (process.env.JARVIS_ASSISTANT_NAME || "未命名角色").trim() || "未命名角色";
 const MEMORY_RECALL_TIMEOUT_MS = Number(process.env.JARVIS_MEMORY_RECALL_TIMEOUT_MS || 120);
 const VOICE_TRANSCRIPT_CUSTOM_TYPE = "realtime-voice-transcript";
@@ -300,7 +323,7 @@ async function extensionCatalog() {
   const definitions = [
     ["jarvis_voice_control", "语音与待机", "云端 TTS、音色配置和唤醒词待机控制。", ["set_tts_voice", "set_assistant_standby"], true],
     ["jarvis_character_control", "角色状态", "把 Agent 的表达状态同步给原生交互形象。", ["show_assistant_expression"], true],
-    ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task"], true],
+    ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task", "cancel_task"], true],
     ["jarvis_youtube_media", "YouTube 视频", "搜索、播放、读取字幕和控制公开 YouTube 视频。", ["youtube_media"], true],
     ["jarvis_screen_control", "屏幕协同", "通过 Windows-MCP 读取屏幕、识别 Windows UI 并执行明确的鼠标键盘操作。", ["screen_snapshot", "screen_state", "screen_action"], true],
     ["jarvis_long_memory", "长期记忆", "在 Pi 会话外接入长期记忆召回，不改变短期上下文。", [], Boolean(MEM0_API_KEY)],
@@ -359,15 +382,20 @@ async function createSessionEntry(sessionManager) {
   let entry;
   entry = {
     sessionManager,
+    eventBus: createEventBus(),
     memoryContext: "",
     currentTurnPrompt: "",
     live: null,
     eventListeners: new Set(),
     unsubscribeEvents: null,
+    unsubscribeTaskEvents: null,
+    taskEventSeq: 0,
+    pendingTaskFollowUps: [],
   };
   const resourceLoader = new DefaultResourceLoader({
     cwd: ROOT,
     agentDir: resolve(DATA_ROOT, "pi-agent"),
+    eventBus: entry.eventBus,
     extensionFactories: [
       {
         name: "jarvis-long-memory",
@@ -426,11 +454,60 @@ async function createSessionEntry(sessionManager) {
     thinkingLevel: "off",
   });
   entry.session = created.session;
+  entry.taskEventSeq = entry.sessionManager.getEntries()
+    .filter((item) => item?.type === "custom" && item.customType === TASK_ENTRY_TYPE)
+    .length;
   // The standalone agent runtime starts fully capable even when no Web client
   // is connected. A UI preset may narrow built-ins later, but never extensions.
   entry.session.setActiveToolsByName(entry.session.getAllTools().map((tool) => tool.name));
   entry.unsubscribeEvents = created.session.subscribe((event) => publishSessionEvent(entry, event));
+  entry.unsubscribeTaskEvents = entry.eventBus.on(TASK_EVENT_CHANNEL, (event) => recordTaskEvent(entry, event));
   return entry;
+}
+
+function taskState(entry) {
+  const sessionIdValue = entry.sessionManager.getSessionId();
+  const tasks = [...latestTaskRecords(entry.sessionManager.getEntries()).values()]
+    .map((task) => ({ ...task, sessionId: task.sessionId || sessionIdValue }));
+  return {
+    tasks,
+    lastEventSeq: entry.taskEventSeq,
+  };
+}
+
+function taskSnapshot(entry) {
+  const reduced = taskState(entry);
+  return {
+    type: "task.snapshot",
+    sessionId: entry.sessionManager.getSessionId(),
+    tasks: reduced.tasks,
+    lastEventSeq: reduced.lastEventSeq,
+  };
+}
+
+function recordTaskEvent(entry, rawEvent) {
+  if (!rawEvent || typeof rawEvent !== "object") return;
+  const rawTask = rawEvent.task && typeof rawEvent.task === "object" ? rawEvent.task : rawEvent;
+  if (typeof rawTask.taskId !== "string") return;
+  const statusToType = {
+    queued: "task.queued",
+    running: "task.started",
+    completed: "task.completed",
+    failed: "task.failed",
+    cancelled: "task.cancelled",
+    interrupted: "task.interrupted",
+  };
+  const eventType = rawEvent.event === "progress" ? "task.progress" : statusToType[rawTask.status];
+  if (!TASK_LIFECYCLE_TYPES.has(eventType)) return;
+  entry.taskEventSeq += 1;
+  publishBridgeEvent(entry, {
+    ...rawEvent,
+    type: eventType,
+    taskId: rawTask.taskId,
+    sessionId: entry.sessionManager.getSessionId(),
+    seq: entry.taskEventSeq,
+    task: { ...rawTask, sessionId: entry.sessionManager.getSessionId() },
+  });
 }
 
 async function rebaseSession(id) {
@@ -446,6 +523,8 @@ async function rebaseSession(id) {
       await activeEntry.session.abort();
       await activeEntry.session.dispose();
       activeEntry.unsubscribeEvents?.();
+      activeEntry.unsubscribeTaskEvents?.();
+      activeEntry.eventBus.clear();
       sessions.delete(id);
     }
 
@@ -567,6 +646,8 @@ async function saveMemory(userText, assistantText, userId, sessionIdValue) {
 }
 
 function sse(res, payload) {
+  const id = Number(payload?.seq);
+  if (Number.isFinite(id) && id > 0) res.write(`id: ${id}\n`);
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
@@ -610,6 +691,8 @@ function sessionSnapshot(entry) {
     tree: sessionManager.getTree(),
     firstMessage: textFromMessage(firstUser?.message) || "(no messages)",
     totalActiveMs: 0,
+    tasks: taskState(entry).tasks,
+    taskEventCursor: taskState(entry).lastEventSeq,
   };
 }
 
@@ -703,7 +786,66 @@ function persistVoiceTranscript(entry, content, source) {
   });
 }
 
+async function speakBackgroundFollowUp(sessionIdValue, task, content) {
+  const text = String(content || "").trim();
+  if (!text) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3_000);
+  try {
+    const response = await fetch(`${VOICE_RUNTIME_HTTP_BASE}/control/assistant/speak`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        text,
+        source: "background_task",
+        task_id: task?.taskId || undefined,
+        session_id: sessionIdValue,
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      console.warn(`Could not enqueue background speech: HTTP ${response.status}`);
+    }
+  } catch (error) {
+    console.warn(`Could not enqueue background speech: ${String(error?.message || error)}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function publishSessionEvent(entry, event) {
+  if (
+    event.type === "message_start"
+    && event.message?.role === "custom"
+    && event.message.customType === "jarvis-subagent-result"
+  ) {
+    entry.pendingTaskFollowUps.push({
+      taskId: event.message.details?.taskId || null,
+      status: event.message.details?.status || null,
+      text: "",
+    });
+  }
+  const pendingTask = entry.pendingTaskFollowUps[0];
+  if (
+    pendingTask
+    && event.type === "message_update"
+    && event.message?.role === "assistant"
+    && event.assistantMessageEvent?.type === "text_delta"
+  ) {
+    pendingTask.text += event.assistantMessageEvent.delta || "";
+  }
+  if (
+    pendingTask
+    && event.type === "message_end"
+    && event.message?.role === "assistant"
+    && event.message.stopReason !== "toolUse"
+  ) {
+    entry.pendingTaskFollowUps.shift();
+    const finalText = pendingTask.text.trim() || textFromMessage(event.message);
+    if (!entry.live && finalText) {
+      void speakBackgroundFollowUp(entry.sessionManager.getSessionId(), pendingTask, finalText);
+    }
+  }
   const payload = toPiJsonEvent(event);
   if (payload) {
     for (const listener of entry.eventListeners) listener(payload);
@@ -712,6 +854,10 @@ function publishSessionEvent(entry, event) {
     const usage = contextUsageEvent(entry);
     for (const listener of entry.eventListeners) listener(usage);
   }
+}
+
+function publishBridgeEvent(entry, event) {
+  for (const listener of entry.eventListeners) listener(event);
 }
 
 async function handleSessionEvents(req, res, id) {
@@ -734,6 +880,7 @@ async function handleSessionEvents(req, res, id) {
     isStreaming: entry.session.isStreaming,
     isPromptRunning: activeRequests.has(id),
   });
+  sse(res, taskSnapshot(entry));
   sse(res, contextUsageEvent(entry));
 
   const heartbeat = setInterval(() => {
@@ -959,8 +1106,31 @@ const server = createServer(async (req, res) => {
           isCompacting: compactingSessions.has(id),
           thinkingLevel: "off",
           model: { provider: "xiaomi", id: MODEL_ID },
+          tasks: taskState(entry).tasks,
+          taskEventCursor: taskState(entry).lastEventSeq,
         },
       });
+    }
+    const tasksMatch = req.method === "GET" && req.url?.match(/^\/v1\/sessions\/([^/?]+)\/tasks$/);
+    if (tasksMatch) {
+      const id = sessionId(decodeURIComponent(tasksMatch[1]));
+      const entry = await getSession(id);
+      const reduced = taskState(entry);
+      return json(res, 200, { sessionId: id, tasks: reduced.tasks, lastEventSeq: reduced.lastEventSeq });
+    }
+    const cancelTaskMatch = req.method === "POST"
+      && req.url?.match(/^\/v1\/sessions\/([^/?]+)\/tasks\/([^/?]+)\/cancel$/);
+    if (cancelTaskMatch) {
+      const id = sessionId(decodeURIComponent(cancelTaskMatch[1]));
+      const taskId = decodeURIComponent(cancelTaskMatch[2]);
+      const entry = await getSession(id);
+      const task = taskState(entry).tasks.find((candidate) => candidate.taskId === taskId);
+      if (!task) return json(res, 404, { error: { message: "task not found" } });
+      if (isTerminalStatus(task.status)) {
+        return json(res, 200, { ok: true, sessionId: id, taskId, status: task.status, idempotent: true });
+      }
+      entry.eventBus.emit(TASK_CANCEL_CHANNEL, { taskId, sessionId: id });
+      return json(res, 202, { ok: true, sessionId: id, taskId, status: task.status, cancellationRequested: true });
     }
     const renameMatch = req.method === "PATCH" && req.url?.match(/^\/v1\/sessions\/([^/?]+)$/);
     if (renameMatch) {
@@ -1051,6 +1221,8 @@ const server = createServer(async (req, res) => {
         await entry.session.abort();
         entry.session.dispose();
         entry.unsubscribeEvents?.();
+        entry.unsubscribeTaskEvents?.();
+        entry.eventBus.clear();
         sessions.delete(id);
       }
       if (sessionIndex[id]) {

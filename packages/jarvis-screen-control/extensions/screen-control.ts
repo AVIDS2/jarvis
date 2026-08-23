@@ -306,6 +306,7 @@ export default function screenControl(pi: ExtensionAPI) {
     promptSnippet: "Inspect the current Windows desktop visually before a screen task.",
     promptGuidelines: [
       "Use screen_snapshot before acting on an unfamiliar desktop or application; its image is the current screen, not a textual approximation.",
+      "If the user asks whether you can see or inspect the desktop, use this tool to verify the current screen instead of denying the registered capability from memory.",
       "Use screen_snapshot only for an explicit screen/computer task. Do not poll the screen during ordinary conversation or voice turns.",
       "After a screen_action, inspect the returned post-action image before claiming the task is complete.",
     ],
