@@ -45,4 +45,11 @@ Run the pure PowerShell smoke test while the local services are running:
 
 ```powershell
 .\scripts\supervisor\supervisor.test.ps1
+
+Run the complete foundation acceptance (health, extensions, session CRUD/rebase,
+task API, and supervisor status):
+
+```powershell
+node .\scripts\full-foundation-smoke.mjs
+```
 ```
