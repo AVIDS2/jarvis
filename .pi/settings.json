@@ -5,7 +5,9 @@
     "..\\packages\\jarvis-voice-control",
     "..\\packages\\jarvis-character-control",
     "..\\packages\\youtube-media",
-    "..\\packages\\jarvis-screen-control"
+    "..\\packages\\jarvis-screen-control",
+    "..\\packages\\jarvis-environment-memory",
+    "..\\packages\\jarvis-desktop-tools"
   ],
   "compaction": {
     "enabled": true

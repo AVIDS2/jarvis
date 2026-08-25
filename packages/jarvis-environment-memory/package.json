@@ -1,0 +1,15 @@
+{
+  "name": "jarvis-environment-memory",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Explicit, local JSONL environment memory for Pi",
+  "keywords": ["pi-package", "jarvis", "environment-memory", "local-first"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/environment-memory.ts"]
+  }
+}

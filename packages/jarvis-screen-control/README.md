@@ -17,6 +17,19 @@ Pi receives three tools:
 - `screen_action`: click, type, scroll, move, shortcut, wait, or app action;
   it returns a fresh screenshot by default for verification.
 
+`screen_snapshot` and `screen_state` are read-only observation tools. The
+action tool uses a structured safety contract:
+
+- `click`, `type`, `shortcut`, and `app` require `allow_destructive: true`.
+- When that field is absent or false, the action returns `blocked: true` and
+  `needsConfirmation: true` without starting Windows-MCP.
+- `dry_run: true` always returns a preview and never starts an action.
+- `verify_after` accepts `screenshot`, `state`, or `none` and defaults to a
+  post-action screenshot. Verification status is returned in `details`.
+
+The policy is based only on the typed action and explicit parameters. It does
+not inspect user wording or use keyword matching.
+
 Override the sidecar without changing the extension:
 
 ```powershell

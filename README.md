@@ -23,7 +23,9 @@
 .\run.ps1 -Ui web
 ```
 
-桌面默认只保留一个 `Jarvis 实时语音助手` 快捷方式，启动原生低延迟界面。`launch-legacy-hidden.vbs` 和 `launch-web-hidden.vbs` 仍可手动用于回归/实验；Web UI 不是生产语音入口。两种界面复用同一套 Whispera 后端、Pi AgentSession 和持久上下文，不要同时启动两个麦克风客户端。
+桌面默认只保留一个 `Jarvis 实时语音助手` 快捷方式，启动原生低延迟界面。`launch-hidden.vbs` 现在启动本地 Supervisor，Supervisor 健康检查 `3030/8111` 并在异常时拉起 `launch-legacy-hidden.vbs`；后者仍可手动用于回归。`launch-web-hidden.vbs` 仅用于 Web 实验；Web UI 不是生产语音入口。两种界面复用同一套 Whispera 后端、Pi AgentSession 和持久上下文，不要同时启动两个麦克风客户端。
+
+可选外接能力包括屏幕协同、后台子代理、环境记忆和受限桌面工具。环境记忆只在 Agent 明确调用时写入本地 JSONL；桌面工具不提供任意 shell；屏幕动作默认只允许观察，点击、输入、快捷键和启动应用需要结构化 `allow_destructive=true`，并默认返回动作后验证结果。
 
 Electron 使用单实例锁；重复点击快捷方式只会唤起现有窗口，不会再启动第二个麦克风客户端。
 

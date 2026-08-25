@@ -323,9 +323,11 @@ async function extensionCatalog() {
   const definitions = [
     ["jarvis_voice_control", "语音与待机", "云端 TTS、音色配置和唤醒词待机控制。", ["set_tts_voice", "set_assistant_standby"], true],
     ["jarvis_character_control", "角色状态", "把 Agent 的表达状态同步给原生交互形象。", ["show_assistant_expression"], true],
-    ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task", "cancel_task"], true],
+    ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task", "cancel_task", "retry_task", "cleanup_task_history"], true],
     ["jarvis_youtube_media", "YouTube 视频", "搜索、播放、读取字幕和控制公开 YouTube 视频。", ["youtube_media"], true],
     ["jarvis_screen_control", "屏幕协同", "通过 Windows-MCP 读取屏幕、识别 Windows UI 并执行明确的鼠标键盘操作。", ["screen_snapshot", "screen_state", "screen_action"], true],
+    ["jarvis_environment_memory", "环境记忆", "只在明确调用时记录、搜索和删除本地环境事实，不持续监听屏幕或麦克风。", ["environment_memory"], true],
+    ["jarvis_desktop_tools", "桌面工具", "通过受限结构化动作操作剪贴板、浏览器、应用、文件定位和本地提醒。", ["desktop_tools"], true],
     ["jarvis_long_memory", "长期记忆", "在 Pi 会话外接入长期记忆召回，不改变短期上下文。", [], Boolean(MEM0_API_KEY)],
   ].map(([id, label, description, tools, enabled]) => ({
     id,

@@ -7,9 +7,13 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { discoverAgents, type AgentConfig } from "./agents.ts";
 import {
+  cleanupTaskRecords,
   isTerminalStatus,
   latestTaskRecords,
   parsePiProgressEvent,
+  retryRecord,
+  RETRYABLE_STATUSES,
+  TASK_CLEANUP_ENTRY_TYPE,
   TASK_ENTRY_TYPE,
   transitionRecord,
 } from "../task-contract.mjs";
@@ -18,6 +22,7 @@ const MAX_TASK_CHARS = 8_000;
 const MAX_RESULT_CHARS = 12_000;
 const SUBAGENT_TIMEOUT_MS = Math.max(30_000, Number(process.env.JARVIS_SUBAGENT_TIMEOUT_MS || 300_000));
 const MAX_CONCURRENT_TASKS = Math.max(1, Number(process.env.JARVIS_SUBAGENT_MAX_CONCURRENCY || 2));
+const MAX_ATTEMPT_HISTORY = 20;
 
 const parameters = Type.Object({
   agent: Type.String({ description: "Name of a project-local subagent from .pi/agents." }),
@@ -26,6 +31,18 @@ const parameters = Type.Object({
 
 const cancelParameters = Type.Object({
   taskId: Type.String({ description: "Task ID returned by delegate_task." }),
+});
+
+const retryParameters = Type.Object({
+  taskId: Type.String({ description: "A failed or interrupted task ID returned by delegate_task." }),
+  reason: Type.Optional(Type.String({ maxLength: 1_000, description: "Why this explicit retry is being requested." })),
+});
+
+const cleanupParameters = Type.Object({
+  statuses: Type.Optional(Type.Array(Type.Union([
+    Type.Literal("completed"), Type.Literal("failed"), Type.Literal("cancelled"), Type.Literal("interrupted"),
+  ]), { minItems: 1, maxItems: 4, description: "Terminal statuses to clean. Omit to select all terminal statuses." })),
+  keep: Type.Optional(Type.Integer({ minimum: 0, maximum: 10_000, description: "Newest records to retain per selected status." })),
 });
 
 type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted";
@@ -42,6 +59,15 @@ interface TaskRecord {
   finishedAt?: string;
   result?: string;
   error?: string;
+  retryReason?: string;
+  retryRequestedAt?: string;
+  attemptHistory?: Array<{
+    attempt: number;
+    startedAt?: string;
+    finishedAt?: string;
+    status: TaskStatus;
+    reason?: string;
+  }>;
   progress?: unknown;
   announced?: boolean;
   sessionFile?: string;
@@ -93,6 +119,30 @@ function stopChildProcessTree(child: ReturnType<typeof spawn>): Promise<void> {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function attemptStartedPatch(record: TaskRecord, startedAt: string): Record<string, unknown> {
+  const attempt = record.attempt + 1;
+  const history = [...(record.attemptHistory || []), {
+    attempt,
+    startedAt,
+    status: "running" as TaskStatus,
+    reason: record.retryReason,
+  }].slice(-MAX_ATTEMPT_HISTORY);
+  return { attempt, startedAt, attemptHistory: history };
+}
+
+function attemptFinishedPatch(record: TaskRecord, status: TaskStatus, finishedAt: string, reason?: string): Record<string, unknown> {
+  const history = [...(record.attemptHistory || [])];
+  let index = -1;
+  for (let cursor = history.length - 1; cursor >= 0; cursor -= 1) {
+    if (history[cursor].attempt === record.attempt) {
+      index = cursor;
+      break;
+    }
+  }
+  if (index >= 0) history[index] = { ...history[index], status, finishedAt, reason: reason || history[index].reason };
+  return { finishedAt, attemptHistory: history };
 }
 
 function modelFor(agent: AgentConfig, ctx: ExtensionContext): string {
@@ -149,7 +199,8 @@ export default function jarvisSubagents(pi: ExtensionAPI) {
     if (!runtime || isTerminalStatus(runtime.record.status)) return false;
     runtime.settled = true;
     runtime.controller.abort();
-    updateTask(taskId, "cancelled", { error: reason, finishedAt: now() }, "cancelled");
+    const finishedAt = now();
+    updateTask(taskId, "cancelled", { error: reason, ...attemptFinishedPatch(runtime.record, "cancelled", finishedAt, reason) }, "cancelled");
     if (runtime.child) await stopChildProcessTree(runtime.child);
     return true;
   };
@@ -171,13 +222,14 @@ export default function jarvisSubagents(pi: ExtensionAPI) {
       await writeFile(promptPath, systemPrompt, { encoding: "utf8", mode: 0o600 });
       if (!active || generation !== taskGeneration || runtime.settled) return;
 
+      updateTask(taskId, "running", attemptStartedPatch(runtime.record, now()), "started");
+
       const piCliPath = process.env.JARVIS_PI_CLI_PATH;
       if (!piCliPath) throw new Error("JARVIS_PI_CLI_PATH is not configured");
       const args = ["--mode", "json", "-p", "--no-session", "--model", worker.model, "--thinking", "off"];
       if (agent.tools?.length) args.push("--tools", agent.tools.join(","));
       args.push("--append-system-prompt", promptPath, `Task: ${task}`);
 
-      updateTask(taskId, "running", { startedAt: now(), attempt: runtime.record.attempt + 1 }, "started");
       await new Promise<void>((resolve, reject) => {
         const child = spawn(process.execPath, [piCliPath, ...args], {
           cwd: worker.cwd,
@@ -236,21 +288,84 @@ export default function jarvisSubagents(pi: ExtensionAPI) {
 
       if (!active || generation !== taskGeneration || runtime.settled) return;
       if (terminateReason === "cancelled") return;
-      updateTask(taskId, "completed", { result: truncate(finalText), finishedAt: now() }, "completed");
+      updateTask(taskId, "completed", {
+        result: truncate(finalText),
+        ...attemptFinishedPatch(runtime.record, "completed", now()),
+      }, "completed");
       announce(runtime);
     } catch (error) {
       if (!active || generation !== taskGeneration || runtime.settled) return;
       const message = error instanceof Error ? error.message : String(error);
-      updateTask(taskId, terminateReason === "cancelled" ? "cancelled" : "failed", {
+      const terminalStatus = terminateReason === "cancelled" ? "cancelled" : "failed";
+      updateTask(taskId, terminalStatus, {
         error: message,
-        finishedAt: now(),
-      }, terminateReason === "cancelled" ? "cancelled" : "failed");
+        ...attemptFinishedPatch(runtime.record, terminalStatus, now(), message),
+      }, terminalStatus);
       announce(runtime);
     } finally {
       if (timeout) clearTimeout(timeout);
       if (runtime.tempDir) await rm(runtime.tempDir, { recursive: true, force: true });
       runtime.tempDir = undefined;
     }
+  };
+
+  const retryTask = async (taskId: string, reason: string, ctx: ExtensionContext) => {
+    const runtime = tasks.get(taskId);
+    if (!runtime) return { accepted: false, code: "not_found" as const, message: `任务 ${taskId} 不存在。` };
+    if (!RETRYABLE_STATUSES.has(runtime.record.status)) {
+      return {
+        accepted: false,
+        code: "not_retryable" as const,
+        message: `任务 ${taskId} 当前状态为 ${runtime.record.status}，只有 failed 或 interrupted 任务可以显式重试。`,
+      };
+    }
+    const activeCount = [...tasks.values()].filter(({ record }) => !isTerminalStatus(record.status)).length;
+    if (activeCount >= MAX_CONCURRENT_TASKS) {
+      return { accepted: false, code: "limit" as const, message: `后台任务并发上限已达到 ${MAX_CONCURRENT_TASKS}。` };
+    }
+    const discovered = discoverAgents(ctx.cwd, "project");
+    const agent = discovered.agents.find((candidate) => candidate.name === runtime.record.agent);
+    if (!agent) {
+      return {
+        accepted: false,
+        code: "agent_missing" as const,
+        message: `项目子代理 '${runtime.record.agent}' 当前不可用，未执行重试。`,
+      };
+    }
+
+    runtime.record = retryRecord(runtime.record, reason) as TaskRecord;
+    runtime.controller = new AbortController();
+    runtime.settled = false;
+    runtime.child = undefined;
+    appendTask(runtime.record, { event: "retry_queued", taskId, retryReason: runtime.record.retryReason });
+    void runTask(runtime, agent, runtime.record.task, { cwd: ctx.cwd, model: modelFor(agent, ctx) });
+    return {
+      accepted: true,
+      code: "queued" as const,
+      message: `任务 ${taskId} 已按显式请求重新排队。`,
+      task: runtime.record,
+    };
+  };
+
+  const cleanupTaskHistory = (statuses: string[] | undefined, keep: number | undefined) => {
+    const current = new Map([...tasks.entries()].map(([taskId, runtime]) => [taskId, runtime.record]));
+    const selection = cleanupTaskRecords(current, { statuses, keep });
+    for (const taskId of selection.removedTaskIds) {
+      const runtime = tasks.get(taskId);
+      if (!runtime || isTerminalStatus(runtime.record.status)) tasks.delete(taskId);
+    }
+    const cleanup = {
+      cleanupId: randomUUID(),
+      statuses: selection.statuses,
+      keep: selection.keep,
+      removedTaskIds: selection.removedTaskIds,
+      activeTaskIds: selection.activeTaskIds,
+      createdAt: now(),
+      sessionFile,
+    };
+    pi.appendEntry(TASK_CLEANUP_ENTRY_TYPE, cleanup);
+    emitTaskEvent({ event: "cleanup", cleanup });
+    return { ...selection, cleanupId: cleanup.cleanupId };
   };
 
   pi.on("session_start", async (_event, ctx) => {
@@ -264,7 +379,11 @@ export default function jarvisSubagents(pi: ExtensionAPI) {
     }
     for (const runtime of tasks.values()) {
       if (runtime.record.status === "queued" || runtime.record.status === "running") {
-        updateTask(runtime.record.taskId, "interrupted", { error: "Task was stale when the session started", finishedAt: now() }, "stale_recovery");
+        const finishedAt = now();
+        updateTask(runtime.record.taskId, "interrupted", {
+          error: "Task was stale when the session started",
+          ...attemptFinishedPatch(runtime.record, "interrupted", finishedAt, "Task was stale when the session started"),
+        }, "stale_recovery");
       }
       if (runtime.record.status !== "queued" && runtime.record.status !== "running" && !runtime.record.announced) {
         announce(runtime);
@@ -285,7 +404,11 @@ export default function jarvisSubagents(pi: ExtensionAPI) {
     for (const runtime of pending) {
       runtime.settled = true;
       runtime.controller.abort();
-      updateTask(runtime.record.taskId, "interrupted", { error: "Session shut down", finishedAt: now() }, "shutdown");
+      const finishedAt = now();
+      updateTask(runtime.record.taskId, "interrupted", {
+        error: "Session shut down",
+        ...attemptFinishedPatch(runtime.record, "interrupted", finishedAt, "Session shut down"),
+      }, "shutdown");
       if (runtime.child) await stopChildProcessTree(runtime.child);
     }
   });
@@ -353,6 +476,52 @@ export default function jarvisSubagents(pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: cancelled ? `已取消后台任务 ${input.taskId}。` : `任务 ${input.taskId} 不存在或已经结束。` }],
         details: { taskId: input.taskId, cancelled },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "retry_task",
+    label: "Retry Task",
+    description: "Explicitly re-queue one failed or interrupted background task. Completed, cancelled, queued, and running tasks are never replayed.",
+    promptSnippet: "Retry only a failed or interrupted background task after an explicit user request.",
+    promptGuidelines: [
+      "Do not retry automatically after a failure or timeout; wait for an explicit retry request.",
+      "Only failed or interrupted tasks are retryable. Never use retry_task for completed, cancelled, queued, or running tasks.",
+      "Preserve the retry reason in the task record and report when the retry is queued, not when it is merely requested.",
+    ],
+    parameters: retryParameters,
+    async execute(_toolCallId, input, _signal, _onUpdate, ctx) {
+      const result = await retryTask(String(input.taskId || ""), String(input.reason || "Manual retry requested"), ctx);
+      return {
+        content: [{ type: "text", text: result.message }],
+        details: { ...result, taskId: input.taskId, reason: input.reason || "Manual retry requested" },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "cleanup_task_history",
+    label: "Cleanup Task History",
+    description: "Logically remove old terminal task records while retaining the newest N records per selected status. Running and queued tasks are never removed.",
+    promptSnippet: "Prune old completed, failed, cancelled, or interrupted task history without touching active tasks.",
+    promptGuidelines: [
+      "Cleanup is explicit and applies only to terminal task records.",
+      "Never claim an active task was removed; the tool reports activeTaskIds and preserves them.",
+      "The keep value is applied per selected terminal status and retains the newest records.",
+    ],
+    parameters: cleanupParameters,
+    async execute(_toolCallId, input) {
+      const result = cleanupTaskHistory(
+        Array.isArray(input.statuses) ? input.statuses.map(String) : undefined,
+        typeof input.keep === "number" ? input.keep : undefined,
+      );
+      return {
+        content: [{
+          type: "text",
+          text: `任务历史清理完成：移除 ${result.removedTaskIds.length} 条终态记录，保留 ${result.keptTaskIds.length} 条；活动任务 ${result.activeTaskIds.length} 条未触碰。`,
+        }],
+        details: result,
       };
     },
   });

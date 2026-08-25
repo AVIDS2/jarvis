@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  cleanupTaskRecords,
   isTerminalStatus,
   latestTaskRecords,
   parsePiProgressEvent,
+  retryRecord,
+  TASK_CLEANUP_ENTRY_TYPE,
   TASK_ENTRY_TYPE,
   transitionRecord,
 } from "./task-contract.mjs";
@@ -38,6 +41,44 @@ test("cancelled is a terminal transition", () => {
   const cancelled = transitionRecord(base, "cancelled", { error: "requested" });
   assert.equal(cancelled.status, "cancelled");
   assert.equal(isTerminalStatus(cancelled.status), true);
+  const lateCancel = transitionRecord({ ...base, status: "completed" }, "cancelled", { error: "late" });
+  assert.equal(lateCancel.status, "completed");
+});
+
+test("retry explicitly re-queues only failed or interrupted records and keeps the reason", () => {
+  const failed = retryRecord({ ...base, status: "failed", attempt: 2, error: "timeout", announced: true }, "network recovered");
+  assert.equal(failed.status, "queued");
+  assert.equal(failed.attempt, 2);
+  assert.equal(failed.retryReason, "network recovered");
+  assert.equal(failed.error, undefined);
+  assert.equal(failed.announced, false);
+
+  const completed = retryRecord({ ...base, status: "completed" }, "should not run");
+  assert.equal(completed.status, "completed");
+  assert.equal(completed.retryReason, undefined);
+});
+
+test("cleanup keeps newest terminal records per status and never removes active tasks", () => {
+  const records = new Map([
+    ["running", { ...base, taskId: "running", status: "running", updatedAt: "2026-08-23T00:10:00.000Z" }],
+    ["failed-old", { ...base, taskId: "failed-old", status: "failed", updatedAt: "2026-08-23T00:01:00.000Z" }],
+    ["failed-new", { ...base, taskId: "failed-new", status: "failed", updatedAt: "2026-08-23T00:02:00.000Z" }],
+    ["cancelled-old", { ...base, taskId: "cancelled-old", status: "cancelled", updatedAt: "2026-08-23T00:01:00.000Z" }],
+    ["cancelled-new", { ...base, taskId: "cancelled-new", status: "cancelled", updatedAt: "2026-08-23T00:02:00.000Z" }],
+  ]);
+  const result = cleanupTaskRecords(records, { statuses: ["failed", "cancelled"], keep: 1 });
+  assert.deepEqual(result.removedTaskIds.sort(), ["cancelled-old", "failed-old"]);
+  assert.deepEqual(result.activeTaskIds, ["running"]);
+  assert.equal(result.keptTaskIds.includes("failed-new"), true);
+  assert.equal(result.keptTaskIds.includes("running"), false);
+});
+
+test("cleanup tombstones survive recovery and suppress later task history", () => {
+  const entries = [
+    { type: "custom", customType: TASK_ENTRY_TYPE, data: { ...base, status: "failed" } },
+    { type: "custom", customType: TASK_CLEANUP_ENTRY_TYPE, data: { removedTaskIds: ["task-1"] } },
+  ];
+  assert.equal(latestTaskRecords(entries).has("task-1"), false);
 });
 
 test("Pi JSON tool events become structured progress without text guessing", () => {

@@ -8,6 +8,17 @@ The package also emits `jarvis:task-event` for live progress and accepts `jarvis
 
 The worker model follows the existing product configuration: project agent `model` first, then the main session model, then the existing MiMo fallback. Luna is a development subagent choice, not a product runtime requirement.
 
+Task lifecycle tools:
+
+- `retry_task` only re-queues `failed` or `interrupted` tasks after an explicit
+  request. There is no automatic replay after failure, timeout, or restart.
+- Each task record keeps its current `attempt`, `retryReason`, retry timestamp,
+  and a bounded `attemptHistory` with start/end status and reason.
+- `cleanup_task_history` keeps the newest N records per selected terminal
+  status. Queued and running tasks are never removed. Pi sessions are
+  append-only, so cleanup writes a tombstone entry consumed by the task index;
+  it does not rewrite or delete the session file.
+
 Runtime limits are configurable without changing the package:
 
 - `JARVIS_SUBAGENT_TIMEOUT_MS` defaults to 300000 (five minutes).

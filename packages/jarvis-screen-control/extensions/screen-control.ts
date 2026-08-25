@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Type } from "typebox";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { evaluateScreenAction, resolveVerificationMode } from "../screen-action-contract.mjs";
 
 type ToolContent = TextContent | ImageContent;
 type JsonRpcResponse = {
@@ -273,6 +274,11 @@ const screenActionParameters = Type.Object({
   window_name: Type.Optional(Type.String()),
   mode: Type.Optional(Type.Union([Type.Literal("launch"), Type.Literal("resize"), Type.Literal("switch")])),
   name: Type.Optional(Type.String()),
+  dry_run: Type.Optional(Type.Boolean({ default: false, description: "Preview the structured action without executing it." })),
+  allow_destructive: Type.Optional(Type.Boolean({ default: false, description: "Explicitly allow click, type, shortcut, or app side effects." })),
+  verify_after: Type.Optional(Type.Union([
+    Type.Literal("screenshot"), Type.Literal("state"), Type.Literal("none"),
+  ], { description: "Post-action verification mode. Defaults to screenshot." })),
   observe_after: Type.Optional(Type.Boolean()),
 });
 
@@ -302,7 +308,7 @@ export default function screenControl(pi: ExtensionAPI) {
   pi.registerTool({
     name: "screen_snapshot",
     label: "Screen Snapshot",
-    description: "Capture the current Windows desktop as an image for MiMo, with cursor position and active-window context.",
+    description: "Observe the current Windows desktop as an image for MiMo. Read-only; it never clicks, types, launches, or changes the desktop.",
     promptSnippet: "Inspect the current Windows desktop visually before a screen task.",
     promptGuidelines: [
       "Use screen_snapshot before acting on an unfamiliar desktop or application; its image is the current screen, not a textual approximation.",
@@ -321,7 +327,7 @@ export default function screenControl(pi: ExtensionAPI) {
   pi.registerTool({
     name: "screen_state",
     label: "Screen State",
-    description: "Inspect the Windows desktop with a screenshot and UI Automation state for interactive controls and their labels.",
+    description: "Observe the Windows desktop with a screenshot and UI Automation state. Read-only; it never performs an action.",
     promptSnippet: "Inspect desktop screenshot plus Windows UI elements before a precise action.",
     promptGuidelines: [
       "Use screen_state when labels, focused windows, or interactive element coordinates matter more than a fast screenshot.",
@@ -336,22 +342,66 @@ export default function screenControl(pi: ExtensionAPI) {
   pi.registerTool({
     name: "screen_action",
     label: "Screen Action",
-    description: "Perform a typed Windows desktop action through Windows-MCP and optionally return a fresh screenshot for visual verification.",
+    description: "Perform a structured Windows desktop action through Windows-MCP. Destructive action types require allow_destructive=true; dry_run previews without execution and verification is returned by default.",
     promptSnippet: "Click, type, scroll, move, use a shortcut, wait, or manage a Windows app, then verify the screen.",
     promptGuidelines: [
       "Use screen_action only after the user has asked for a concrete computer operation and the target is grounded by screen_snapshot or screen_state.",
       "Use the smallest precise action. Do not invent coordinates when the latest screen state provides a label or coordinate.",
-      "Keep observe_after enabled unless the action is a harmless intermediate movement; verify the resulting screenshot before reporting success.",
+      "For click, type, shortcut, and app actions, set allow_destructive=true only when the user's current request explicitly authorizes that operation; otherwise leave it false and report the structured confirmation requirement.",
+      "Use dry_run=true to preview any action without executing it. Keep verify_after at screenshot or state and inspect the returned observation before reporting success.",
       "Do not use screen_action for shell/file tasks already covered by Pi's native tools.",
     ],
     parameters: screenActionParameters,
     async execute(_toolCallId, input, signal, onUpdate) {
+      const actionInput = input as Record<string, unknown>;
+      const decision = evaluateScreenAction(actionInput);
+      const verification = resolveVerificationMode(actionInput);
+      const details = {
+        action: decision.action,
+        decision: decision.decision,
+        blocked: decision.blocked,
+        needsConfirmation: decision.needsConfirmation,
+        dryRun: decision.dryRun,
+        allowDestructive: decision.allowDestructive,
+        reason: decision.reason,
+        verification: { requested: verification, completed: false },
+      };
+
+      if (decision.decision === "blocked") {
+        return {
+          content: [textContent(`屏幕动作已阻止：${decision.reason}。请使用结构化 allow_destructive=true 明确授权后再执行。`)],
+          details,
+        };
+      }
+      const { tool, args } = actionCall(actionInput);
+      if (decision.decision === "preview") {
+        return {
+          content: [textContent(`屏幕动作预览：${decision.action}（未执行）。`)],
+          details: { ...details, preview: { tool, args } },
+        };
+      }
+
       onUpdate?.({ content: [textContent(`正在执行屏幕动作：${String(input.action)}…`)] });
-      const { tool, args } = actionCall(input as Record<string, unknown>);
       const content = await client.call(tool, args, signal);
-      if (input.observe_after === false || tool === "Wait") return { content };
-      const observation = await client.call("Screenshot", { use_annotation: false }, signal);
-      return { content: appendObservation(content, observation) };
+      if (verification === "none") {
+        return { content, details: { ...details, executed: true, verification: { requested: verification, completed: true } } };
+      }
+
+      try {
+        const observation = verification === "state"
+          ? await client.call("Snapshot", { use_vision: true, use_annotation: true, use_ui_tree: true }, signal)
+          : await client.call("Screenshot", { use_annotation: false }, signal);
+        return {
+          content: appendObservation(content, observation),
+          details: { ...details, executed: true, verification: { requested: verification, completed: true } },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [...content, textContent(`动作已执行，但操作后验证失败：${message}`)],
+          details: { ...details, executed: true, verification: { requested: verification, completed: false, error: message } },
+        };
+      }
     },
   });
 
