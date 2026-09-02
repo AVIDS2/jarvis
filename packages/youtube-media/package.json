@@ -1,0 +1,15 @@
+{
+  "name": "jarvis-youtube-media",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "External Pi extension for YouTube search, playback, metadata, and transcripts",
+  "keywords": ["pi-package", "youtube", "video", "transcript", "mpv"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/youtube-media.ts"]
+  }
+}

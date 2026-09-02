@@ -245,12 +245,9 @@ async function ensureLoggedIn() {
   const result = await runCli(["login", "--check", "--output", "json"]);
   const status = parseJsonOutput<{ success?: boolean; message?: string }>(result.stdout, "NetEase Music login check");
   if (status.success) return;
-
-  const login = await runCli(["login", "--background", "--output", "json"]);
-  const guidance = [login.stdout, login.stderr].filter(Boolean).join("\n").trim();
   dynamicCommandCache = null;
   throw new Error(
-    `NetEase Music login expired. The official CLI started a new login flow. ${guidance || status.message || "Complete the login and retry."}`,
+    `NetEase Music is not authenticated. Run 'ncm-cli login' once, then retry. Jarvis will not start a repeated login flow automatically. ${status.message || "The saved login session is missing or expired."}`,
   );
 }
 

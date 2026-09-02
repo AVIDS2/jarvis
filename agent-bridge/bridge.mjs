@@ -1,19 +1,45 @@
 import { createServer } from "node:http";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
-import { complete, getModel } from "@earendil-works/pi-ai/compat";
-import { createAgentSession, DefaultResourceLoader, SessionManager } from "@earendil-works/pi-coding-agent";
+import { getModel, streamSimple } from "@earendil-works/pi-ai/compat";
+import {
+  createAgentSession,
+  createEventBus,
+  DefaultResourceLoader,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { authorizeStandbyChange } from "./standby-authorization.mjs";
 import {
   visualStateFromToolEnd,
   visualStateFromToolStart,
   visualStateFromToolUpdate,
 } from "./visual-state.mjs";
+import {
+  isTerminalStatus,
+  latestTaskRecords,
+  TASK_ENTRY_TYPE,
+} from "../packages/jarvis-subagents/task-contract.mjs";
+
+const TASK_EVENT_CHANNEL = "jarvis:task-event";
+const TASK_CANCEL_CHANNEL = "jarvis:task-cancel";
+const TASK_LIFECYCLE_TYPES = new Set([
+  "task.queued",
+  "task.started",
+  "task.progress",
+  "task.completed",
+  "task.failed",
+  "task.cancelled",
+  "task.interrupted",
+]);
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const execFileAsync = promisify(execFile);
 const envFile = resolve(ROOT, ".env");
 
 function loadEnvFile(path) {
@@ -37,14 +63,15 @@ loadEnvFile(envFile);
 
 const PORT = Number(process.env.JARVIS_PORT || 3030);
 const MODEL_ID = process.env.JARVIS_MODEL || "mimo-v2.5";
-const ASSISTANT_NAME = (process.env.JARVIS_ASSISTANT_NAME || "实时语音助手").trim() || "实时语音助手";
+const VOICE_RUNTIME_HTTP_BASE = (process.env.MINIMIND_BACKEND_HTTP_BASE || "http://127.0.0.1:8111").replace(/\/$/, "");
+const ASSISTANT_NAME = (process.env.JARVIS_ASSISTANT_NAME || "未命名角色").trim() || "未命名角色";
 const MEMORY_RECALL_TIMEOUT_MS = Number(process.env.JARVIS_MEMORY_RECALL_TIMEOUT_MS || 120);
 const VOICE_TRANSCRIPT_CUSTOM_TYPE = "realtime-voice-transcript";
 const SESSION_REBASE_SUMMARY = [
   "This is a deliberate conversation handoff under the current workspace AGENTS.md rules.",
   "Discard all historical persona, user-name, and form-of-address assumptions.",
   "Address the user as 你 by default. Do not use any fixed name or pet name unless the user explicitly asks in the current conversation.",
-  `The assistant is ${ASSISTANT_NAME}, the user's private real-time computer voice assistant.`,
+  `The active character's presentation name is ${ASSISTANT_NAME}; this name is not a capability label. Answer future identity questions from the loaded character persona and world setting.`,
   "Keep future conversation continuity from this point forward; the prior session is retained only as an archive.",
 ].join(" ");
 const XIAOMI_API_KEY = (process.env.XIAOMI_API_KEY || "").trim();
@@ -54,6 +81,14 @@ const SESSION_ROOT = resolve(DATA_ROOT, "pi-sessions");
 const SESSION_INDEX_PATH = resolve(DATA_ROOT, "pi-session-index.json");
 const USER_SESSIONS_PATH = resolve(DATA_ROOT, "user-sessions.json");
 const PI_CLI_PATH = resolve(ROOT, "..", "pi", "packages", "coding-agent", "dist", "cli.js");
+const NETEASE_ROOT = resolve(ROOT, "packages", "netease-music");
+const NETEASE_CLI = resolve(NETEASE_ROOT, "node_modules", "@music163", "ncm-cli", "dist", "index.js");
+const NETEASE_CONFIG_ROOT = resolve(
+  process.env.XDG_CONFIG_HOME || resolve(homedir(), ".config"),
+  "ncm-cli",
+);
+const NETEASE_CREDENTIALS = resolve(NETEASE_CONFIG_ROOT, "credentials.enc.json");
+const NETEASE_CONFIG = resolve(NETEASE_CONFIG_ROOT, "config.json");
 mkdirSync(SESSION_ROOT, { recursive: true });
 if (existsSync(PI_CLI_PATH) && !process.env.JARVIS_PI_CLI_PATH) process.env.JARVIS_PI_CLI_PATH = PI_CLI_PATH;
 
@@ -160,6 +195,182 @@ function sessionId(value) {
   return id;
 }
 
+const NETEASE_ACTION_ARGS = Object.freeze({
+  pause: ["pause"],
+  resume: ["resume"],
+  next: ["next"],
+  previous: ["prev"],
+  stop: ["stop"],
+  state: ["state"],
+});
+
+async function runNeteaseCli(args, timeout = 5000) {
+  return execFileAsync(process.execPath, [NETEASE_CLI, ...args], {
+    cwd: NETEASE_ROOT,
+    env: process.env,
+    windowsHide: true,
+    timeout,
+    maxBuffer: 256 * 1024,
+  });
+}
+
+function powershellLiteral(value) {
+  return `'${String(value).replace(/'/g, "''")}'`;
+}
+
+function launchNeteaseLogin() {
+  if (!existsSync(NETEASE_CLI)) throw new Error("ncm-cli 未安装");
+  if (process.platform !== "win32") throw new Error("当前仅实现 Windows 终端登录启动");
+
+  const command = [
+    `$Host.UI.RawUI.WindowTitle = ${powershellLiteral("Jarvis · 网易云官方登录")}`,
+    `Set-Location -LiteralPath ${powershellLiteral(NETEASE_ROOT)}`,
+    `& ${powershellLiteral(process.execPath)} ${powershellLiteral(NETEASE_CLI)} login`,
+  ].join("; ");
+  const child = spawn("powershell.exe", ["-NoExit", "-NoLogo", "-Command", command], {
+    cwd: NETEASE_ROOT,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: false,
+  });
+  child.unref();
+  return { started: true };
+}
+
+function parseCliJson(stdout) {
+  try {
+    return JSON.parse(String(stdout || "").trim());
+  } catch {
+    return null;
+  }
+}
+
+function musicStateSummary(state) {
+  const status = String(state?.status || "").toLowerCase();
+  const labels = { playing: "播放中", paused: "已暂停", stopped: "已停止" };
+  const label = labels[status] || (status ? status : "状态未知");
+  const queueLength = Number.isFinite(Number(state?.queueLength)) ? `，队列 ${state.queueLength} 首` : "";
+  return `网易云：${label}${queueLength}`;
+}
+
+function commandNames(stdout) {
+  return String(stdout || "")
+    .split(/\r?\n/)
+    .map((line) => /^([a-z][a-z0-9-]*)\s/.exec(line)?.[1])
+    .filter(Boolean);
+}
+
+async function neteaseExtensionStatus() {
+  const configured = existsSync(NETEASE_CONFIG) && existsSync(NETEASE_CREDENTIALS);
+  if (!existsSync(NETEASE_CLI)) {
+    return {
+      id: "netease_music",
+      label: "网易云音乐",
+      package: "@music163/ncm-cli",
+      status: "unavailable",
+      description: "未找到本地 ncm-cli，播放控制不会伪装成可用。",
+      auth: { configured, authenticated: false, message: "ncm-cli 未安装" },
+      player: { summary: "播放器不可用" },
+      availableActions: [],
+    };
+  }
+
+  let authenticated = false;
+  let authMessage = configured ? "登录态未验证" : "尚未完成一次 CLI 配置和登录";
+  try {
+    const result = await runNeteaseCli(["login", "--check", "--output", "json"]);
+    const payload = parseCliJson(result.stdout);
+    authenticated = payload?.success === true;
+    authMessage = String(payload?.message || (authenticated ? "登录态有效" : authMessage));
+  } catch {
+    authMessage = "登录检查失败，未自动发起登录";
+  }
+
+  let player = { summary: "播放器状态未读取" };
+  try {
+    const result = await runNeteaseCli(["state", "--output", "json"]);
+    const payload = parseCliJson(result.stdout);
+    if (payload?.state) player = { ...payload.state, summary: musicStateSummary(payload.state) };
+  } catch {
+    player = { summary: "播放器状态不可用" };
+  }
+
+  let availableActions = [];
+  try {
+    const result = await runNeteaseCli(["commands"]);
+    const names = new Set(commandNames(result.stdout));
+    availableActions = ["search", "recommend", "pause", "resume", "next", "prev", "stop", "state", "volume", "play"]
+      .filter((name) => names.has(name));
+  } catch {
+    // The capability panel remains useful with auth/player state alone.
+  }
+
+  return {
+    id: "netease_music",
+    label: "网易云音乐",
+    package: "@music163/ncm-cli",
+    status: authenticated ? "ready" : configured ? "auth_required" : "needs_setup",
+    description: availableActions.includes("search")
+      ? "Pi 外部扩展，通过 ncm-cli 控制本机播放器和搜索。"
+      : "Pi 外部扩展，可控制本机播放器；当前安装的 ncm-cli 未暴露 search 命令，点歌能力暂不可用。",
+    auth: { configured, authenticated, message: authMessage },
+    player,
+    availableActions,
+  };
+}
+
+async function extensionCatalog() {
+  const definitions = [
+    ["jarvis_voice_control", "语音与待机", "云端 TTS、音色配置和唤醒词待机控制。", ["set_tts_voice", "set_assistant_standby"], true],
+    ["jarvis_character_control", "角色状态", "把 Agent 的表达状态同步给原生交互形象。", ["show_assistant_expression"], true],
+    ["jarvis_subagents", "后台子代理", "按 Pi 扩展生命周期派发可追踪的后台任务。", ["delegate_task", "cancel_task", "retry_task", "cleanup_task_history"], true],
+    ["jarvis_youtube_media", "YouTube 视频", "搜索、播放、读取字幕和控制公开 YouTube 视频。", ["youtube_media"], true],
+    ["jarvis_screen_control", "屏幕协同", "通过 Windows-MCP 读取屏幕、识别 Windows UI 并执行明确的鼠标键盘操作。", ["screen_snapshot", "screen_state", "screen_action"], true],
+    ["jarvis_environment_memory", "环境记忆", "只在明确调用时记录、搜索和删除本地环境事实，不持续监听屏幕或麦克风。", ["environment_memory"], true],
+    ["jarvis_desktop_tools", "桌面工具", "通过受限结构化动作操作剪贴板、浏览器、应用、文件定位和本地提醒。", ["desktop_tools"], true],
+    ["jarvis_long_memory", "长期记忆", "在 Pi 会话外接入长期记忆召回，不改变短期上下文。", [], Boolean(MEM0_API_KEY)],
+  ].map(([id, label, description, tools, enabled]) => ({
+    id,
+    label,
+    package: id,
+    tools,
+    status: enabled ? "已加载" : "未配置",
+    description: enabled ? description : `${description} 当前未配置 Mem0 API Key，不会伪装成已启用。`,
+  }));
+  return {
+    generatedAt: new Date().toISOString(),
+    extensions: [...definitions, await neteaseExtensionStatus()],
+  };
+}
+
+async function controlNeteaseMusic(action, payload = {}) {
+  const args = action === "volume"
+    ? ["volume", String(Math.max(0, Math.min(100, Number(payload.level))))]
+    : NETEASE_ACTION_ARGS[action];
+  if (action === "volume" && !Number.isFinite(Number(payload.level))) {
+    throw new Error("volume must be a number between 0 and 100");
+  }
+  if (!args) throw new Error("unsupported music control action");
+  const result = await runNeteaseCli(args);
+  const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+  const resultPayload = parseCliJson(result.stdout);
+  let state = resultPayload?.state || null;
+  if (!state && action !== "state") {
+    try {
+      const stateResult = await runNeteaseCli(["state", "--output", "json"]);
+      state = parseCliJson(stateResult.stdout)?.state || null;
+    } catch {
+      // The command already succeeded; the panel can still show its result.
+    }
+  }
+  return {
+    action,
+    state: state || null,
+    summary: state ? musicStateSummary(state) : `网易云命令已执行：${action}`,
+    output: output.slice(0, 2000),
+  };
+}
+
 async function getSession(id) {
   let entry = sessions.get(id);
   if (entry) return entry;
@@ -173,15 +384,20 @@ async function createSessionEntry(sessionManager) {
   let entry;
   entry = {
     sessionManager,
+    eventBus: createEventBus(),
     memoryContext: "",
     currentTurnPrompt: "",
     live: null,
     eventListeners: new Set(),
     unsubscribeEvents: null,
+    unsubscribeTaskEvents: null,
+    taskEventSeq: 0,
+    pendingTaskFollowUps: [],
   };
   const resourceLoader = new DefaultResourceLoader({
     cwd: ROOT,
     agentDir: resolve(DATA_ROOT, "pi-agent"),
+    eventBus: entry.eventBus,
     extensionFactories: [
       {
         name: "jarvis-long-memory",
@@ -191,8 +407,8 @@ async function createSessionEntry(sessionManager) {
             return {
               systemPrompt: [
                 event.systemPrompt,
-                `Runtime identity: your configured display name is ${ASSISTANT_NAME}. When asked who you are, introduce yourself using that exact name.`,
-                "Realtime work rule: when the current request requires a tool or other external work, emit one short natural spoken acknowledgement as your first assistant text before issuing the tool call. Let the wording follow the conversation; do not repeat the user's request, use a fixed template, or mention internal tools. Then continue with tool execution and useful progress updates.",
+                `Runtime presentation name: ${ASSISTANT_NAME}. This is only the current display name; it is not a role definition and must not force you to describe yourself as a voice assistant. When asked who you are, say this exact name first unless an explicitly loaded character profile provides another name, then answer from the loaded character and world setting.`,
+                activeCapabilityHint(entry),
                 entry.memoryContext,
               ].filter(Boolean).join("\n\n"),
             };
@@ -211,14 +427,21 @@ async function createSessionEntry(sessionManager) {
               }
             }
             const live = entry.live;
-            if (!live || live.assistantTextStarted || live.acknowledgementSent || !live.sendProgress) return;
+            if (!live || live.assistantTextStarted || live.acknowledgementSent || !live.sendProgress) {
+              live?.flushVisualQueue?.();
+              return;
+            }
             const acknowledgement = await generateToolAcknowledgement(ctx.model || model, live.userText);
-            if (!acknowledgement || entry.live !== live || !live.sendProgress) return;
+            if (!acknowledgement || entry.live !== live || !live.sendProgress) {
+              live.flushVisualQueue?.();
+              return;
+            }
             live.acknowledgementSent = true;
             live.sendProgress(acknowledgement, "tool_acknowledgement");
             // Let the streamed acknowledgement reach the TTS worker before the
             // real tool starts. It is short enough not to make work feel gated.
             await new Promise((resolve) => setTimeout(resolve, TOOL_ACK_AUDIO_LEAD_MS));
+            live.flushVisualQueue?.();
           });
         },
       },
@@ -234,11 +457,60 @@ async function createSessionEntry(sessionManager) {
     thinkingLevel: "off",
   });
   entry.session = created.session;
+  entry.taskEventSeq = entry.sessionManager.getEntries()
+    .filter((item) => item?.type === "custom" && item.customType === TASK_ENTRY_TYPE)
+    .length;
   // The standalone agent runtime starts fully capable even when no Web client
   // is connected. A UI preset may narrow built-ins later, but never extensions.
   entry.session.setActiveToolsByName(entry.session.getAllTools().map((tool) => tool.name));
   entry.unsubscribeEvents = created.session.subscribe((event) => publishSessionEvent(entry, event));
+  entry.unsubscribeTaskEvents = entry.eventBus.on(TASK_EVENT_CHANNEL, (event) => recordTaskEvent(entry, event));
   return entry;
+}
+
+function taskState(entry) {
+  const sessionIdValue = entry.sessionManager.getSessionId();
+  const tasks = [...latestTaskRecords(entry.sessionManager.getEntries()).values()]
+    .map((task) => ({ ...task, sessionId: task.sessionId || sessionIdValue }));
+  return {
+    tasks,
+    lastEventSeq: entry.taskEventSeq,
+  };
+}
+
+function taskSnapshot(entry) {
+  const reduced = taskState(entry);
+  return {
+    type: "task.snapshot",
+    sessionId: entry.sessionManager.getSessionId(),
+    tasks: reduced.tasks,
+    lastEventSeq: reduced.lastEventSeq,
+  };
+}
+
+function recordTaskEvent(entry, rawEvent) {
+  if (!rawEvent || typeof rawEvent !== "object") return;
+  const rawTask = rawEvent.task && typeof rawEvent.task === "object" ? rawEvent.task : rawEvent;
+  if (typeof rawTask.taskId !== "string") return;
+  const statusToType = {
+    queued: "task.queued",
+    running: "task.started",
+    completed: "task.completed",
+    failed: "task.failed",
+    cancelled: "task.cancelled",
+    interrupted: "task.interrupted",
+  };
+  const eventType = rawEvent.event === "progress" ? "task.progress" : statusToType[rawTask.status];
+  if (!TASK_LIFECYCLE_TYPES.has(eventType)) return;
+  entry.taskEventSeq += 1;
+  publishBridgeEvent(entry, {
+    ...rawEvent,
+    type: eventType,
+    taskId: rawTask.taskId,
+    sessionId: entry.sessionManager.getSessionId(),
+    seq: entry.taskEventSeq,
+    task: { ...rawTask, sessionId: entry.sessionManager.getSessionId() },
+  });
 }
 
 async function rebaseSession(id) {
@@ -254,6 +526,8 @@ async function rebaseSession(id) {
       await activeEntry.session.abort();
       await activeEntry.session.dispose();
       activeEntry.unsubscribeEvents?.();
+      activeEntry.unsubscribeTaskEvents?.();
+      activeEntry.eventBus.clear();
       sessions.delete(id);
     }
 
@@ -282,10 +556,18 @@ function textFromMessage(message) {
   return message.content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("").trim();
 }
 
-const TOOL_ACK_TIMEOUT_MS = 2_500;
+function activeCapabilityHint(entry) {
+  if (!entry.session) return "";
+  const names = entry.session.getActiveToolNames()
+    .filter((name) => !BUILTIN_TOOL_NAMES.has(name));
+  if (!names.length) return "当前没有额外外接工具。";
+  return `当前会话已加载并启用的外接工具：${names.join("、")}。这些工具描述是当前真实能力清单；不要因为角色是语音伙伴就否认它们。用户明确要求相关观察或操作时，调用最匹配的工具并以返回结果为准。`;
+}
+
+const TOOL_ACK_TIMEOUT_MS = 4_000;
 const TOOL_ACK_AUDIO_LEAD_MS = 900;
 const TOOL_ACK_SYSTEM_PROMPT = [
-  `你是${ASSISTANT_NAME}的实时语音对话层。用户刚提出一个需要执行的请求。`,
+  `你是当前角色的实时语音回应层。用户刚提出一个需要执行的请求。`,
   "只输出一句自然、简短、适合立刻朗读的回应，表示你已接住这件事并马上开始。",
   "语气跟随上下文，避免套话，不要复述、引用或总结用户原话，不要提及工具、系统、模型、处理中。",
   "不要 Markdown、emoji、引号或解释。若无法自然回应，输出空文本。",
@@ -295,7 +577,7 @@ async function generateToolAcknowledgement(currentModel, userText) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), TOOL_ACK_TIMEOUT_MS);
   try {
-    const response = await complete(
+    const stream = streamSimple(
       currentModel,
       {
         systemPrompt: TOOL_ACK_SYSTEM_PROMPT,
@@ -309,12 +591,27 @@ async function generateToolAcknowledgement(currentModel, userText) {
       },
       { signal: controller.signal, reasoning: "off", maxTokens: 48 },
     );
-    if (response.stopReason === "aborted" || response.stopReason === "error") {
-      console.warn(`Tool acknowledgement was not generated: ${response.errorMessage || response.stopReason}`);
-      return "";
+    let text = "";
+    for await (const event of stream) {
+      if (event.type === "text_delta") {
+        text += event.delta;
+        const normalized = text.replace(/\s+/g, " ").trim();
+        if (normalized.length > 96) {
+          controller.abort();
+          return "";
+        }
+        if (/[。！？!?]$/.test(normalized)) {
+          controller.abort();
+          return normalized;
+        }
+      }
+      if (event.type === "error") {
+        console.warn(`Tool acknowledgement was not generated: ${event.error.errorMessage || event.reason}`);
+        return "";
+      }
     }
-    const text = textFromMessage(response).replace(/\s+/g, " ").trim();
-    return text.length > 0 && text.length <= 96 ? text : "";
+    const normalized = text.replace(/\s+/g, " ").trim();
+    return normalized.length > 0 && normalized.length <= 96 ? normalized : "";
   } catch (error) {
     console.warn(`Tool acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
     return "";
@@ -360,7 +657,26 @@ async function saveMemory(userText, assistantText, userId, sessionIdValue) {
 }
 
 function sse(res, payload) {
+  const id = Number(payload?.seq);
+  if (Number.isFinite(id) && id > 0) res.write(`id: ${id}\n`);
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+function publicAgentError(message, code = null) {
+  const raw = String(message || "").trim();
+  const lower = raw.toLowerCase();
+  const normalizedCode = code
+    || (lower.includes("content_filter") || lower.includes("content-filter") ? "content_filter" : null)
+    || (lower.includes("timed out") || lower.includes("timeout") ? "timeout" : null)
+    || (lower.includes("connection") || lower.includes("network") || lower.includes("socket") ? "transport" : null)
+    || (lower.includes("upstream") || /\b50[0-4]\b/.test(lower) ? "upstream" : null)
+    || (lower.includes("speakable response") ? "empty_response" : null)
+    || "unknown";
+  return {
+    message: raw || "The agent turn failed.",
+    code: normalizedCode,
+    retryable: normalizedCode !== "content_filter",
+  };
 }
 
 // Pi's JSON/RPC modes project streaming events this way: message deltas are
@@ -403,6 +719,8 @@ function sessionSnapshot(entry) {
     tree: sessionManager.getTree(),
     firstMessage: textFromMessage(firstUser?.message) || "(no messages)",
     totalActiveMs: 0,
+    tasks: taskState(entry).tasks,
+    taskEventCursor: taskState(entry).lastEventSeq,
   };
 }
 
@@ -496,7 +814,66 @@ function persistVoiceTranscript(entry, content, source) {
   });
 }
 
+async function speakBackgroundFollowUp(sessionIdValue, task, content) {
+  const text = String(content || "").trim();
+  if (!text) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 3_000);
+  try {
+    const response = await fetch(`${VOICE_RUNTIME_HTTP_BASE}/control/assistant/speak`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        text,
+        source: "background_task",
+        task_id: task?.taskId || undefined,
+        session_id: sessionIdValue,
+      }),
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      console.warn(`Could not enqueue background speech: HTTP ${response.status}`);
+    }
+  } catch (error) {
+    console.warn(`Could not enqueue background speech: ${String(error?.message || error)}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 function publishSessionEvent(entry, event) {
+  if (
+    event.type === "message_start"
+    && event.message?.role === "custom"
+    && event.message.customType === "jarvis-subagent-result"
+  ) {
+    entry.pendingTaskFollowUps.push({
+      taskId: event.message.details?.taskId || null,
+      status: event.message.details?.status || null,
+      text: "",
+    });
+  }
+  const pendingTask = entry.pendingTaskFollowUps[0];
+  if (
+    pendingTask
+    && event.type === "message_update"
+    && event.message?.role === "assistant"
+    && event.assistantMessageEvent?.type === "text_delta"
+  ) {
+    pendingTask.text += event.assistantMessageEvent.delta || "";
+  }
+  if (
+    pendingTask
+    && event.type === "message_end"
+    && event.message?.role === "assistant"
+    && event.message.stopReason !== "toolUse"
+  ) {
+    entry.pendingTaskFollowUps.shift();
+    const finalText = pendingTask.text.trim() || textFromMessage(event.message);
+    if (!entry.live && finalText) {
+      void speakBackgroundFollowUp(entry.sessionManager.getSessionId(), pendingTask, finalText);
+    }
+  }
   const payload = toPiJsonEvent(event);
   if (payload) {
     for (const listener of entry.eventListeners) listener(payload);
@@ -505,6 +882,10 @@ function publishSessionEvent(entry, event) {
     const usage = contextUsageEvent(entry);
     for (const listener of entry.eventListeners) listener(usage);
   }
+}
+
+function publishBridgeEvent(entry, event) {
+  for (const listener of entry.eventListeners) listener(event);
 }
 
 async function handleSessionEvents(req, res, id) {
@@ -527,6 +908,7 @@ async function handleSessionEvents(req, res, id) {
     isStreaming: entry.session.isStreaming,
     isPromptRunning: activeRequests.has(id),
   });
+  sse(res, taskSnapshot(entry));
   sse(res, contextUsageEvent(entry));
 
   const heartbeat = setInterval(() => {
@@ -570,6 +952,8 @@ async function handleCompletion(req, res, payload) {
     assistantTextStarted: false,
     sendProgress: null,
     sendVisualState: null,
+    visualQueue: [],
+    flushVisualQueue: null,
     spokenProgress: new Set(),
   };
   entry.live = live;
@@ -587,6 +971,26 @@ async function handleCompletion(req, res, payload) {
     if (!visualEvent || disconnected || res.writableEnded) return;
     sse(res, visualEvent);
   };
+  live.flushVisualQueue = () => {
+    if (!live.visualQueue.length) return;
+    const queued = live.visualQueue.splice(0);
+    for (const visualEvent of queued) live.sendVisualState(visualEvent);
+  };
+  const queueOrSendVisualState = (visualEvent, toolName) => {
+    if (!visualEvent) return;
+    // A visual work indicator must not get ahead of the model-generated spoken
+    // acknowledgement. This is an SSE-only ordering buffer; the Pi tool hook
+    // still owns execution and remains independent of the browser.
+    if (
+      toolName !== "show_assistant_expression"
+      && !live.assistantTextStarted
+      && !live.acknowledgementSent
+    ) {
+      live.visualQueue.push(visualEvent);
+      return;
+    }
+    live.sendVisualState(visualEvent);
+  };
   const onResponseClose = () => {
     if (res.writableEnded) return;
     disconnected = true;
@@ -597,18 +1001,18 @@ async function handleCompletion(req, res, payload) {
   const unsubscribe = entry.session.subscribe((event) => {
     if (disconnected) return;
     if (event.type === "tool_execution_start") {
-      live.sendVisualState?.(visualStateFromToolStart(event));
+      queueOrSendVisualState(visualStateFromToolStart(event), event.toolName);
       return;
     }
     if (event.type === "tool_execution_update") {
-      live.sendVisualState?.(visualStateFromToolUpdate(event));
+      queueOrSendVisualState(visualStateFromToolUpdate(event), event.toolName);
       const progress = spokenToolUpdate(event.partialResult);
       if (!progress) return;
       sendProgress(progress, "tool_progress");
       return;
     }
     if (event.type === "tool_execution_end") {
-      live.sendVisualState?.(visualStateFromToolEnd(event));
+      queueOrSendVisualState(visualStateFromToolEnd(event), event.toolName);
       return;
     }
     if (event.type === "message_update") {
@@ -637,7 +1041,7 @@ async function handleCompletion(req, res, payload) {
   try {
     await entry.session.prompt(userText);
     if (!disconnected && assistantFailure) {
-      sse(res, { error: { message: assistantFailure } });
+      sse(res, { error: publicAgentError(assistantFailure) });
       res.write("data: [DONE]\n\n");
     } else if (!disconnected && (assistantText.trim() || live.acknowledgementSent)) {
       if (assistantText.trim()) {
@@ -651,7 +1055,12 @@ async function handleCompletion(req, res, payload) {
       sse(res, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
       res.write("data: [DONE]\n\n");
     } else if (!disconnected) {
-      sse(res, { error: { message: "The agent turn ended without a speakable response." } });
+      sse(res, { error: publicAgentError("The agent turn ended without a speakable response.", "empty_response") });
+      res.write("data: [DONE]\n\n");
+    }
+  } catch (error) {
+    if (!disconnected && !res.writableEnded) {
+      sse(res, { error: publicAgentError(error?.message || error) });
       res.write("data: [DONE]\n\n");
     }
   } finally {
@@ -677,6 +1086,28 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "GET" && req.url === "/v1/models") {
       return json(res, 200, { object: "list", data: [{ id: MODEL_ID, object: "model", owned_by: "xiaomi" }] });
+    }
+    if (req.method === "GET" && req.url === "/v1/extensions") {
+      return json(res, 200, await extensionCatalog());
+    }
+    if (req.method === "POST" && req.url === "/v1/extensions/netease-music/login") {
+      try {
+        return json(res, 200, launchNeteaseLogin());
+      } catch (error) {
+        return json(res, 409, { error: { message: error.message || "无法启动网易云官方登录" } });
+      }
+    }
+    if (req.method === "POST" && req.url === "/v1/extensions/netease-music/control") {
+      const payload = await body(req);
+      const action = String(payload.action || "").trim();
+      if (!NETEASE_ACTION_ARGS[action] && action !== "volume") {
+        return json(res, 400, { error: { message: "unsupported music control action" } });
+      }
+      try {
+        return json(res, 200, await controlNeteaseMusic(action, payload));
+      } catch (error) {
+        return json(res, 502, { error: { message: "网易云播放器命令执行失败，请检查 ncm-cli 和本机播放器。" } });
+      }
     }
     if (req.method === "GET" && req.url === "/v1/sessions") {
       return json(res, 200, { sessions: await listUserSessions() });
@@ -708,8 +1139,31 @@ const server = createServer(async (req, res) => {
           isCompacting: compactingSessions.has(id),
           thinkingLevel: "off",
           model: { provider: "xiaomi", id: MODEL_ID },
+          tasks: taskState(entry).tasks,
+          taskEventCursor: taskState(entry).lastEventSeq,
         },
       });
+    }
+    const tasksMatch = req.method === "GET" && req.url?.match(/^\/v1\/sessions\/([^/?]+)\/tasks$/);
+    if (tasksMatch) {
+      const id = sessionId(decodeURIComponent(tasksMatch[1]));
+      const entry = await getSession(id);
+      const reduced = taskState(entry);
+      return json(res, 200, { sessionId: id, tasks: reduced.tasks, lastEventSeq: reduced.lastEventSeq });
+    }
+    const cancelTaskMatch = req.method === "POST"
+      && req.url?.match(/^\/v1\/sessions\/([^/?]+)\/tasks\/([^/?]+)\/cancel$/);
+    if (cancelTaskMatch) {
+      const id = sessionId(decodeURIComponent(cancelTaskMatch[1]));
+      const taskId = decodeURIComponent(cancelTaskMatch[2]);
+      const entry = await getSession(id);
+      const task = taskState(entry).tasks.find((candidate) => candidate.taskId === taskId);
+      if (!task) return json(res, 404, { error: { message: "task not found" } });
+      if (isTerminalStatus(task.status)) {
+        return json(res, 200, { ok: true, sessionId: id, taskId, status: task.status, idempotent: true });
+      }
+      entry.eventBus.emit(TASK_CANCEL_CHANNEL, { taskId, sessionId: id });
+      return json(res, 202, { ok: true, sessionId: id, taskId, status: task.status, cancellationRequested: true });
     }
     const renameMatch = req.method === "PATCH" && req.url?.match(/^\/v1\/sessions\/([^/?]+)$/);
     if (renameMatch) {
@@ -800,6 +1254,8 @@ const server = createServer(async (req, res) => {
         await entry.session.abort();
         entry.session.dispose();
         entry.unsubscribeEvents?.();
+        entry.unsubscribeTaskEvents?.();
+        entry.eventBus.clear();
         sessions.delete(id);
       }
       if (sessionIndex[id]) {

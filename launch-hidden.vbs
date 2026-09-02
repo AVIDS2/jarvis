@@ -4,8 +4,8 @@ Dim shell, filesystem, scriptPath, command
 Set shell = CreateObject("WScript.Shell")
 Set filesystem = CreateObject("Scripting.FileSystemObject")
 
-scriptPath = filesystem.BuildPath(filesystem.GetParentFolderName(WScript.ScriptFullName), "run.ps1")
-command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptPath & """ -Ui legacy"
+scriptPath = filesystem.BuildPath(filesystem.GetParentFolderName(WScript.ScriptFullName), "scripts\jarvis-supervisor.ps1")
+command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & scriptPath & """ -Mode watch"
 
-' The production launcher keeps Whispera's native renderer on the audio path.
+' The production launcher starts the local watchdog; it owns the native audio stack's recovery.
 shell.Run command, 0, False

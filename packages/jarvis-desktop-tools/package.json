@@ -1,0 +1,15 @@
+{
+  "name": "jarvis-desktop-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded Windows desktop actions and local reminders for Pi",
+  "keywords": ["pi-package", "jarvis", "desktop", "clipboard", "reminder"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/desktop-tools.ts"]
+  }
+}

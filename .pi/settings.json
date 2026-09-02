@@ -3,9 +3,22 @@
     "..\\packages\\netease-music",
     "..\\packages\\jarvis-subagents",
     "..\\packages\\jarvis-voice-control",
-    "..\\packages\\jarvis-character-control"
+    "..\\packages\\jarvis-character-control",
+    "..\\packages\\youtube-media",
+    "..\\packages\\jarvis-screen-control",
+    "..\\packages\\jarvis-environment-memory",
+    "..\\packages\\jarvis-desktop-tools"
   ],
   "compaction": {
     "enabled": true
-  }
+  },
+  "retry": {
+    "enabled": false,
+    "provider": {
+      "timeoutMs": 75000,
+      "maxRetries": 0,
+      "maxRetryDelayMs": 5000
+    }
+  },
+  "httpIdleTimeoutMs": 75000
 }
