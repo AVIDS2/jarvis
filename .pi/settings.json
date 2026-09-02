@@ -11,5 +11,14 @@
   ],
   "compaction": {
     "enabled": true
-  }
+  },
+  "retry": {
+    "enabled": false,
+    "provider": {
+      "timeoutMs": 75000,
+      "maxRetries": 0,
+      "maxRetryDelayMs": 5000
+    }
+  },
+  "httpIdleTimeoutMs": 75000
 }

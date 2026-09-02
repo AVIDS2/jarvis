@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("web", "legacy")]
+  [ValidateSet("web", "legacy", "react")]
   [string]$Ui = "legacy"
 )
 
@@ -18,6 +18,7 @@ $env:MINIMIND_BACKEND_HTTP_BASE = "http://127.0.0.1:8111"
 $env:MINIMIND_BACKEND_WS_URL = "ws://127.0.0.1:8111/ws/realtime"
 $env:MINIMIND_ASR_MODE = "cloud"
 $env:MINIMIND_TTS_MODE = "cloud"
+$env:MINIMIND_MEMORY_ENABLED = "0"
 $env:PYTHON = Join-Path $root ".venv\Scripts\python.exe"
 $webRoot = Join-Path $root "..\pi-web"
 $webUrl = "http://127.0.0.1:30141/"
@@ -40,6 +41,7 @@ function Stop-StartedWebServer {
   }
 }
 if ($Ui -eq "web") {
+  Remove-Item Env:JARVIS_DISABLE_GPU -ErrorAction SilentlyContinue
   if (-not (Test-Path $webRoot)) {
     throw "pi-web is missing: $webRoot"
   }
@@ -68,11 +70,23 @@ if ($Ui -eq "web") {
   $env:JARVIS_WEB_URL = $webUrl
 } else {
   Remove-Item Env:JARVIS_WEB_URL -ErrorAction SilentlyContinue
+  if ($Ui -eq "react") {
+    $env:JARVIS_RENDERER = "react"
+  } else {
+    Remove-Item Env:JARVIS_RENDERER -ErrorAction SilentlyContinue
+  }
+  # Native voice mode uses software composition to avoid Windows Chromium
+  # GPU black frames; the audio/agent services remain separate processes.
+  $env:JARVIS_DISABLE_GPU = "1"
 }
 
 Push-Location (Join-Path $root "..\whispera\electron-app")
 try {
-  npm start
+  if ($Ui -eq "react") {
+    npm run start:react
+  } else {
+    npm start
+  }
 } finally {
   Pop-Location
   Stop-StartedWebServer

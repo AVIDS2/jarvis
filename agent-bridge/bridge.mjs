@@ -662,6 +662,23 @@ function sse(res, payload) {
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+function publicAgentError(message, code = null) {
+  const raw = String(message || "").trim();
+  const lower = raw.toLowerCase();
+  const normalizedCode = code
+    || (lower.includes("content_filter") || lower.includes("content-filter") ? "content_filter" : null)
+    || (lower.includes("timed out") || lower.includes("timeout") ? "timeout" : null)
+    || (lower.includes("connection") || lower.includes("network") || lower.includes("socket") ? "transport" : null)
+    || (lower.includes("upstream") || /\b50[0-4]\b/.test(lower) ? "upstream" : null)
+    || (lower.includes("speakable response") ? "empty_response" : null)
+    || "unknown";
+  return {
+    message: raw || "The agent turn failed.",
+    code: normalizedCode,
+    retryable: normalizedCode !== "content_filter",
+  };
+}
+
 // Pi's JSON/RPC modes project streaming events this way: message deltas are
 // linear-size, while every other AgentSession event stays structurally native.
 function toPiJsonEvent(event) {
@@ -1024,7 +1041,7 @@ async function handleCompletion(req, res, payload) {
   try {
     await entry.session.prompt(userText);
     if (!disconnected && assistantFailure) {
-      sse(res, { error: { message: assistantFailure } });
+      sse(res, { error: publicAgentError(assistantFailure) });
       res.write("data: [DONE]\n\n");
     } else if (!disconnected && (assistantText.trim() || live.acknowledgementSent)) {
       if (assistantText.trim()) {
@@ -1038,7 +1055,12 @@ async function handleCompletion(req, res, payload) {
       sse(res, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
       res.write("data: [DONE]\n\n");
     } else if (!disconnected) {
-      sse(res, { error: { message: "The agent turn ended without a speakable response." } });
+      sse(res, { error: publicAgentError("The agent turn ended without a speakable response.", "empty_response") });
+      res.write("data: [DONE]\n\n");
+    }
+  } catch (error) {
+    if (!disconnected && !res.writableEnded) {
+      sse(res, { error: publicAgentError(error?.message || error) });
       res.write("data: [DONE]\n\n");
     }
   } finally {
