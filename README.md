@@ -254,13 +254,10 @@ Jarvis 的原创集成代码和项目扩展采用 [MIT License](./LICENSE)。本
 - [mem0ai/mem0](https://github.com/mem0ai/mem0)：Apache-2.0，可选长期记忆能力。
 - [linux.do](https://linux.do/)：中文开源社区交流与反馈来源。
 
-## 发布说明
+## 发布状态
 
-本仓库当前远端仍可能处于 private 或开发分支状态。公开发布前请确认：
+仓库已经公开，当前公开的 Source Alpha 位于 [feat/full-foundation-baseline](https://github.com/AVIDS2/jarvis/tree/feat/full-foundation-baseline)。默认 main 分支按发布流程暂时保持原样，没有被直接覆盖；审阅通过后再通过 Pull Request 合并。
 
-1. 目标分支已通过脱敏扫描、安装检查和实时验收。
-2. LICENSE、第三方声明、贡献指南和安全政策已随提交发布。
-3. GitHub 仓库可见性、默认分支和 Release 内容由维护者明确确认。
-4. 绝不公开 .env、API key、runtime/、账号登录态或本地会话文件。
+公开分支已经包含 LICENSE、第三方声明、贡献指南和安全政策。绝不公开 .env、API key、runtime/、账号登录态或本地会话文件。
 
 这是一款正在成长的开源桌面 Agent。它的价值不只在“能回答”，更在于每次聆听、每次打断、每个工具动作和每个上下文都可以被看见、被验证、被继续改进。
