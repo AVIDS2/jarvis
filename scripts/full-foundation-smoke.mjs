@@ -4,6 +4,25 @@ import { execFileSync } from "node:child_process";
 const bridge = process.env.JARVIS_BRIDGE_URL || "http://127.0.0.1:3030";
 const voice = process.env.JARVIS_VOICE_HTTP_URL || "http://127.0.0.1:8111";
 
+// Voice authority is a launch-time code path (run.ps1 -Ui legacy), not a
+// property of the checked-out branch. Report what is actually running so a
+// voice regression is never attributed to the wrong renderer/branch.
+function reportCheckedOutRevisions() {
+  const repos = { jarvis: ".", whispera: "../whispera", pi: "../pi" };
+  const revisions = {};
+  for (const [name, dir] of Object.entries(repos)) {
+    try {
+      revisions[name] = {
+        branch: execFileSync("git", ["-C", dir, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim(),
+        commit: execFileSync("git", ["-C", dir, "rev-parse", "--short", "HEAD"], { encoding: "utf8" }).trim(),
+      };
+    } catch {
+      revisions[name] = { branch: null, commit: null };
+    }
+  }
+  return revisions;
+}
+
 async function request(url, options) {
   const response = await fetch(url, options);
   const payload = await response.json().catch(() => ({}));
@@ -67,4 +86,5 @@ console.log(JSON.stringify({
   extensions: [...extensionIds],
   session_crud_rebase: true,
   supervisor,
+  revisions: reportCheckedOutRevisions(),
 }, null, 2));

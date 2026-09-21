@@ -19,9 +19,43 @@ param(
 
 $ErrorActionPreference = "Stop"
 $script:Root = Split-Path -Parent $PSScriptRoot
+
+# The supervisor must probe the same ports the launcher actually binds. Read
+# them from jarvis/.env (the same file run.ps1 loads) so a changed JARVIS_PORT
+# or realtime endpoint cannot make the supervisor watch a dead port forever and
+# relaunch an already-healthy stack. Defaults match run.ps1.
 $script:BridgePort = 3030
 $script:VoicePort = 8111
-$script:LaunchScript = Join-Path $script:Root "launch-legacy-hidden.vbs"
+$script:EnvPath = Join-Path $script:Root ".env"
+if (Test-Path -LiteralPath $script:EnvPath) {
+  foreach ($rawLine in (Get-Content -LiteralPath $script:EnvPath -Encoding utf8)) {
+    $line = $rawLine.Trim()
+    if (-not $line -or $line.StartsWith("#")) { continue }
+    $separator = $line.IndexOf("=")
+    if ($separator -lt 1) { continue }
+    $key = $line.Substring(0, $separator).Trim()
+    $value = $line.Substring($separator + 1).Trim().Trim("'").Trim('"')
+    switch ($key) {
+      "JARVIS_PORT" {
+        $parsed = 0
+        if ([int]::TryParse($value, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le 65535) {
+          $script:BridgePort = $parsed
+        }
+      }
+      "MINIMIND_BACKEND_HTTP_BASE" {
+        $portMatch = [regex]::Match($value, ":(\d{1,5})(?:/|$)")
+        if ($portMatch.Success) {
+          $parsed = [int]$portMatch.Groups[1].Value
+          if ($parsed -ge 1 -and $parsed -le 65535) {
+            $script:VoicePort = $parsed
+          }
+        }
+      }
+    }
+  }
+}
+
+$script:LaunchScript = Join-Path $script:Root "launch-react-hidden.vbs"
 $script:DiagnosticsDir = Join-Path $script:Root "runtime\diagnostics"
 $script:LogPath = if ($LogPath) { $LogPath } else { Join-Path $script:DiagnosticsDir "supervisor.jsonl" }
 $script:StatePath = if ($StatePath) { $StatePath } else { Join-Path $script:DiagnosticsDir "supervisor-state.json" }
@@ -226,11 +260,14 @@ function Test-LiveLockFile {
 }
 
 function Acquire-Lock {
-  $script:Mutex = New-Object Threading.Mutex($false, "Local\JarvisSupervisor-3030-8111")
+  # Scope the lock to the supervised ports so two stacks on different ports can
+  # coexist, while a duplicate supervisor for the same stack still collides.
+  $script:MutexName = "Local\JarvisSupervisor-$($script:BridgePort)-$($script:VoicePort)"
+  $script:Mutex = New-Object Threading.Mutex($false, $script:MutexName)
   try {
     if (-not $script:Mutex.WaitOne(0)) {
       Write-JsonLog "lock_busy" @{ lock_path = $script:LockPath }
-      throw "Jarvis supervisor is already running for ports 3030/8111."
+      throw "Jarvis supervisor is already running for ports $($script:BridgePort)/$($script:VoicePort)."
     }
   } catch [Threading.AbandonedMutexException] {
     $script:MutexHeld = $true

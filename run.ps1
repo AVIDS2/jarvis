@@ -1,6 +1,6 @@
 param(
   [ValidateSet("web", "legacy", "react")]
-  [string]$Ui = "legacy"
+  [string]$Ui = "react"
 )
 
 $ErrorActionPreference = "Stop"
@@ -12,10 +12,15 @@ Get-Content (Join-Path $root ".env") -Encoding utf8 | ForEach-Object {
   }
 }
 
-$env:MINIMIND_JARVIS_BRIDGE_URL = "http://127.0.0.1:$($env:JARVIS_PORT)"
-$env:MINIMIND_JARVIS_BRIDGE_MODEL = $env:JARVIS_MODEL
-$env:MINIMIND_BACKEND_HTTP_BASE = "http://127.0.0.1:8111"
-$env:MINIMIND_BACKEND_WS_URL = "ws://127.0.0.1:8111/ws/realtime"
+# .env is the single source of truth for ports. Never clobber a value the
+# operator set there: the supervisor reads the same .env, so forcing a default
+# here would make it probe a port nothing binds and relaunch a healthy stack.
+$resolvedBridgePort = if ($env:JARVIS_PORT) { $env:JARVIS_PORT } else { "3030" }
+$env:JARVIS_PORT = $resolvedBridgePort
+$env:MINIMIND_JARVIS_BRIDGE_URL = "http://127.0.0.1:$resolvedBridgePort"
+if ($env:JARVIS_MODEL) { $env:MINIMIND_JARVIS_BRIDGE_MODEL = $env:JARVIS_MODEL }
+if (-not $env:MINIMIND_BACKEND_HTTP_BASE) { $env:MINIMIND_BACKEND_HTTP_BASE = "http://127.0.0.1:8111" }
+if (-not $env:MINIMIND_BACKEND_WS_URL) { $env:MINIMIND_BACKEND_WS_URL = "ws://127.0.0.1:8111/ws/realtime" }
 $env:MINIMIND_ASR_MODE = "cloud"
 $env:MINIMIND_TTS_MODE = "cloud"
 $env:MINIMIND_MEMORY_ENABLED = "0"
