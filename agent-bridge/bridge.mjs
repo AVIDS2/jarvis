@@ -66,6 +66,10 @@ const MODEL_ID = process.env.JARVIS_MODEL || "mimo-v2.5";
 const VOICE_RUNTIME_HTTP_BASE = (process.env.MINIMIND_BACKEND_HTTP_BASE || "http://127.0.0.1:8111").replace(/\/$/, "");
 const ASSISTANT_NAME = (process.env.JARVIS_ASSISTANT_NAME || "未命名角色").trim() || "未命名角色";
 const MEMORY_RECALL_TIMEOUT_MS = Number(process.env.JARVIS_MEMORY_RECALL_TIMEOUT_MS || 120);
+// Bounds for the best-effort long-term write path. Mem0's add() is an async
+// enqueue, so this only caps the enqueue round trip, never extraction work.
+const MEMORY_SAVE_TIMEOUT_MS = Number(process.env.JARVIS_MEMORY_SAVE_TIMEOUT_MS || 10_000);
+const MEMORY_SAVE_MAX_PENDING = Number(process.env.JARVIS_MEMORY_SAVE_MAX_PENDING || 8);
 const VOICE_TRANSCRIPT_CUSTOM_TYPE = "realtime-voice-transcript";
 const SESSION_REBASE_SUMMARY = [
   "This is a deliberate conversation handoff under the current workspace AGENTS.md rules.",
@@ -564,6 +568,13 @@ function activeCapabilityHint(entry) {
   return `当前会话已加载并启用的外接工具：${names.join("、")}。这些工具描述是当前真实能力清单；不要因为角色是语音伙伴就否认它们。用户明确要求相关观察或操作时，调用最匹配的工具并以返回结果为准。`;
 }
 
+// Speech-first work lifecycle: the model answers with one short spoken line
+// before a tool runs, so the user hears an acknowledgement instead of silence.
+// Both numbers are deliberate latency budget, not overhead to be trimmed: the
+// request is bounded to 4s/48 tokens and bails on the first sentence, and the
+// 900ms lead lets that streamed audio reach the TTS worker before the real tool
+// starts. Removing the lead makes the acknowledgement and the tool race in the
+// audio queue; removing the timeout makes a slow provider stall the tool.
 const TOOL_ACK_TIMEOUT_MS = 4_000;
 const TOOL_ACK_AUDIO_LEAD_MS = 900;
 const TOOL_ACK_SYSTEM_PROMPT = [
@@ -633,6 +644,9 @@ async function recall(userText, userId) {
   // Long-term recall is useful, but it must never hold up a realtime voice turn.
   // Pi's persisted session remains the authoritative short-term conversation context.
   const timeout = new Promise((resolve) => setTimeout(() => resolve(null), MEMORY_RECALL_TIMEOUT_MS));
+  // `top_k` is already the wire name mem0ai v3 expects; its camelCase->snake_case
+  // serializer leaves an all-lowercase key untouched, so both `top_k` and `topK`
+  // reach /v3/memories/search/ as `top_k`.
   const result = await Promise.race([
     memory.search(userText, { filters: { user_id: userId }, top_k: 5 }),
     timeout,
@@ -645,15 +659,64 @@ async function recall(userText, userId) {
   return lines.length ? `\n\n长期记忆（仅在相关时使用）：\n${lines.map((line) => `- ${line}`).join("\n")}` : "";
 }
 
-async function saveMemory(userText, assistantText, userId, sessionIdValue) {
-  if (!memory) return;
-  await memory.add(
-    [
-      { role: "user", content: userText },
-      { role: "assistant", content: assistantText },
-    ],
-    { user_id: userId, metadata: { source: "jarvis", session_id: sessionIdValue } },
-  );
+// Long-term storage is best-effort and never on a turn's critical path.
+//
+// Mem0's POST /v3/memories/add/ is an async enqueue: the SDK's default
+// infer=true returns {"event_id","status":"PENDING"} and the extraction LLM runs
+// server-side afterwards. The only local cost is therefore one short HTTP round
+// trip, not the extraction. That trip still needs an explicit bound, because the
+// SDK calls native fetch with no timeout and no abort signal (the axios instance
+// it builds with `timeout: 6e4` is never used), so a half-open connection would
+// otherwise hang unbounded. Saves are serialized and capped so a fast
+// conversation cannot accumulate concurrent or abandoned requests.
+const memorySaveState = { pending: 0, dropped: 0, lastError: null, lastSavedAt: null };
+let memorySaveChain = Promise.resolve();
+
+function saveMemory(userText, assistantText, userId, sessionIdValue) {
+  if (!memory) return memorySaveChain;
+  if (memorySaveState.pending >= MEMORY_SAVE_MAX_PENDING) {
+    memorySaveState.dropped += 1;
+    console.warn(`Dropping long-term memory write: ${memorySaveState.pending} already pending`);
+    return memorySaveChain;
+  }
+  memorySaveState.pending += 1;
+  const task = memorySaveChain.then(async () => {
+    let timer;
+    try {
+      await Promise.race([
+        memory.add(
+          [
+            { role: "user", content: userText },
+            { role: "assistant", content: assistantText },
+          ],
+          { user_id: userId, metadata: { source: "jarvis", session_id: sessionIdValue } },
+        ),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`Mem0 add did not settle within ${MEMORY_SAVE_TIMEOUT_MS}ms`)),
+            MEMORY_SAVE_TIMEOUT_MS,
+          );
+          // A best-effort write must never hold the process open.
+          timer.unref?.();
+        }),
+      ]);
+      memorySaveState.lastError = null;
+      memorySaveState.lastSavedAt = new Date().toISOString();
+    } catch (error) {
+      // A quota, network or validation failure is not a model failure, and the
+      // turn has already been spoken by the time this runs, so it must never
+      // reach the caller's error path.
+      memorySaveState.lastError = String(error?.message || error).slice(0, 200);
+      console.warn(`Could not save long-term memory: ${memorySaveState.lastError}`);
+    } finally {
+      clearTimeout(timer);
+      memorySaveState.pending -= 1;
+    }
+  });
+  // The inner catch settles every path, so the chain never rejects and an
+  // un-awaited caller produces no unhandled rejection.
+  memorySaveChain = task;
+  return task;
 }
 
 function sse(res, payload) {
@@ -1044,11 +1107,16 @@ async function handleCompletion(req, res, payload) {
       sse(res, { error: publicAgentError(assistantFailure) });
       res.write("data: [DONE]\n\n");
     } else if (!disconnected && (assistantText.trim() || live.acknowledgementSent)) {
-      if (assistantText.trim()) {
-        await saveMemory(userText, assistantText, String(payload.user_id || "local_user"), id);
-      }
       sse(res, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
       res.write("data: [DONE]\n\n");
+      // The turn is settled on the wire before long-term storage is touched.
+      // saveMemory queues the write in the background with its own timeout, so
+      // neither a slow nor a half-open Mem0 connection can hold this SSE stream
+      // open past Whispera's 75s deadline and misreport a completed, already
+      // spoken turn as a model timeout.
+      if (assistantText.trim()) {
+        void saveMemory(userText, assistantText, String(payload.user_id || "local_user"), id);
+      }
     } else if (!disconnected && assistantAborted && live.abortRequested) {
       // A voice or UI interruption is a successful cancellation, not an LLM
       // failure. The realtime backend already owns the interrupted state.
@@ -1082,6 +1150,9 @@ const server = createServer(async (req, res) => {
         model: MODEL_ID,
         memory: Boolean(memory),
         memoryRecallTimeoutMs: MEMORY_RECALL_TIMEOUT_MS,
+        // Long-term writes are background; surface their health without
+        // reading or blocking any turn.
+        memorySave: memory ? { ...memorySaveState } : null,
       });
     }
     if (req.method === "GET" && req.url === "/v1/models") {
